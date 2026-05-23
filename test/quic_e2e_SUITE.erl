@@ -47,7 +47,8 @@
 -export([
     connection_close_normal/1,
     connection_close_error/1,
-    connection_idle_timeout/1
+    connection_idle_timeout/1,
+    keep_alive_prevents_idle_close/1
 ]).
 
 %%====================================================================
@@ -80,7 +81,8 @@ groups() ->
         {connection_lifecycle, [sequence], [
             connection_close_normal,
             connection_close_error,
-            connection_idle_timeout
+            connection_idle_timeout,
+            keep_alive_prevents_idle_close
         ]}
     ].
 
@@ -410,6 +412,39 @@ connection_idle_timeout(Config) ->
             after 30000 ->
                 % If no timeout occurred, close manually
                 ct:pal("No idle timeout received, closing manually"),
+                quic:close(ConnRef, normal),
+                ok
+            end
+    after 10000 ->
+        quic:close(ConnRef, timeout),
+        ct:fail("Connection timeout")
+    end.
+
+%% @doc Keep-alive must keep an otherwise-idle connection open past its
+%% idle timeout. The keep-alive timer is armed at the connected transition
+%% (not at init) and re-arms on each fire, so PINGs sent every
+%% keep_alive_interval reset activity and the idle timer never elapses.
+%% A regression that armed keep-alive too early (and lost it during a long
+%% handshake) or failed to re-arm would let the idle timeout close the
+%% connection here.
+keep_alive_prevents_idle_close(Config) ->
+    Host = ?config(host, Config),
+    Port = ?config(port, Config),
+
+    %% keep_alive (5s, the minimum) fires before the 8s idle timeout, so the
+    %% connection should stay open well past 8s of application inactivity.
+    Opts = #{verify => false, idle_timeout => 8000, keep_alive_interval => 5000},
+    {ok, ConnRef} = quic:connect(Host, Port, Opts, self()),
+
+    receive
+        {quic, ConnRef, {connected, _Info}} ->
+            receive
+                {quic, ConnRef, {closed, idle_timeout}} ->
+                    ct:fail("Connection idle-closed despite keep-alive");
+                {quic, ConnRef, {closed, Reason}} ->
+                    ct:fail({unexpected_close, Reason})
+            after 14000 ->
+                %% Survived >1.5 idle windows: keep-alive is working.
                 quic:close(ConnRef, normal),
                 ok
             end

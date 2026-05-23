@@ -580,9 +580,9 @@
     pmtu_probe_timer :: reference() | undefined,
     pmtu_raise_timer :: reference() | undefined,
 
-    %% Timer batching dirty flags (reduce timer operations per packet)
-    %% These are flushed after batch boundaries via flush_dirty_timers/1
-    timer_dirty = false :: boolean(),
+    %% Deferred PTO timer reset, flushed at batch boundaries via
+    %% flush_dirty_timers/1. (Idle and keep-alive timers are lazy and
+    %% re-arm only on fire, so they need no dirty flag.)
     pto_dirty = false :: boolean(),
 
     %% 1-RTT ACK decimation (RFC 9002 §6.2). Count of ack-eliciting
@@ -1077,7 +1077,10 @@ init({server, Opts}) ->
     %% Emit qlog connection_started event
     quic_qlog:connection_started(State#state.qlog_ctx),
 
-    {ok, idle, State}.
+    %% RFC 9000 §10.1: arm the idle timer once; it re-arms itself lazily
+    %% from last_activity (the keep-alive timer is armed on entering the
+    %% connected state).
+    {ok, idle, set_idle_timer(State)}.
 
 %% Build congestion control options from connection options.
 %% Supports:
@@ -1433,7 +1436,10 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
     %% Emit qlog connection_started event
     quic_qlog:connection_started(State#state.qlog_ctx),
 
-    {ok, idle, State}.
+    %% RFC 9000 §10.1: arm the idle timer once; it re-arms itself lazily
+    %% from last_activity (the keep-alive timer is armed on entering the
+    %% connected state).
+    {ok, idle, set_idle_timer(State)}.
 
 terminate(
     Reason,
@@ -1742,8 +1748,11 @@ connected(
     %% skip retry on the next reconnect. Only when a token secret is
     %% available; clients don't issue tokens.
     State3b = maybe_send_new_token(State3),
-    %% RFC 9000 Section 10.1: Start idle timer when entering connected state
-    State4 = update_last_activity(State3b),
+    %% Refresh activity and arm the keep-alive timer now that we're connected:
+    %% its handler runs only in the connected state, so arming it earlier
+    %% would risk a handshake-phase fire being dropped without a re-arm. The
+    %% idle timer was already armed at init.
+    State4 = set_keep_alive_timer(update_last_activity(State3b)),
     %% RFC 8899: Initialize PMTU discovery after handshake
     State5 = init_pmtu_probing(TransportParams, State4),
     {keep_state, State5};
@@ -2264,10 +2273,19 @@ handle_common_event(
 ) when
     Ref =/= undefined
 ->
-    %% Send keep-alive PING and reset timer
-    State1 = send_keep_alive_ping(State#state{keep_alive_timer = undefined}),
-    State2 = flush_dirty_timers(flush_socket_batch(State1)),
-    {keep_state, set_keep_alive_timer(State2)};
+    Now = erlang:monotonic_time(millisecond),
+    case (Now - State#state.last_activity) < State#state.keep_alive_interval of
+        true ->
+            %% Activity since the timer was armed: re-arm for the remainder,
+            %% no PING needed.
+            {keep_state, set_keep_alive_timer(State#state{keep_alive_timer = undefined})};
+        false ->
+            %% Idle for a full interval: send a PING (which refreshes
+            %% last_activity via the send path) and re-arm a full interval.
+            State1 = send_keep_alive_ping(State#state{keep_alive_timer = undefined}),
+            State2 = flush_dirty_timers(flush_socket_batch(State1)),
+            {keep_state, set_keep_alive_timer(State2)}
+    end;
 handle_common_event(info, {keep_alive_timeout, _StaleRef}, _StateName, State) ->
     %% Ignore stale keep-alive timer (ref doesn't match or wrong state)
     {keep_state, State};
@@ -3349,7 +3367,6 @@ send_app_packet_internal(Payload, Frames, State) ->
                 packets_sent = State#state.packets_sent + 1,
                 socket_state = EffectiveSocketState,
                 last_activity = Now,
-                timer_dirty = true,
                 pto_dirty = true
             };
         {error, Reason, ClearedSocketState} ->
@@ -6511,41 +6528,22 @@ merge_ack_ranges([{S1, E1}, {S2, E2} | Rest]) when E2 + 1 >= S1 ->
 merge_ack_ranges(Ranges) ->
     Ranges.
 
-%% Update last activity timestamp with dirty flag (batched timer reset)
-%% The actual timer reset happens in flush_dirty_timers/1 at batch boundaries
+%% Record activity. The idle and keep-alive timers read last_activity at
+%% fire time (lazy model), so no timer op is needed per packet.
 update_last_activity(State) ->
     update_last_activity(State, erlang:monotonic_time(millisecond)).
 
 %% Now-accepting variant used by the receive hot path.
 update_last_activity(State, Now) ->
-    mark_activity_dirty(State, Now).
+    State#state{last_activity = Now}.
 
-%% Mark activity dirty - defers timer reset until batch flush
-mark_activity_dirty(State, Now) ->
-    State#state{
-        last_activity = Now,
-        timer_dirty = true
-    }.
-
-%% Flush dirty timers at batch boundaries
-%% This batches multiple timer operations into a single reset per batch
-flush_dirty_timers(#state{timer_dirty = false, pto_dirty = false} = State) ->
+%% Flush the deferred PTO timer reset at batch boundaries. The idle and
+%% keep-alive timers are lazy (armed once, re-armed only on fire), so the
+%% only deferred timer left is the PTO.
+flush_dirty_timers(#state{pto_dirty = false} = State) ->
     State;
-flush_dirty_timers(State) ->
-    State1 =
-        case State#state.timer_dirty of
-            true ->
-                S1 = set_idle_timer(State),
-                set_keep_alive_timer(S1#state{timer_dirty = false});
-            false ->
-                State
-        end,
-    case State1#state.pto_dirty of
-        true ->
-            set_pto_timer(State1#state{pto_dirty = false});
-        false ->
-            State1
-    end.
+flush_dirty_timers(#state{pto_dirty = true} = State) ->
+    set_pto_timer(State#state{pto_dirty = false}).
 
 %% RFC 9000 §4.6: as peer-initiated streams reach their final state we
 %% extend the MAX_STREAMS credit by one and send a MAX_STREAMS frame so
@@ -8323,10 +8321,18 @@ maybe_reschedule_pacing(State) ->
 %% Uses unique reference in message to detect stale timer events
 set_idle_timer(#state{idle_timeout = 0} = State) ->
     State#state{idle_timer = undefined};
-set_idle_timer(#state{idle_timeout = Timeout, idle_timer = OldTimer} = State) ->
+set_idle_timer(
+    #state{idle_timeout = Timeout, idle_timer = OldTimer, last_activity = LastActivity} = State
+) ->
     cancel_timer(OldTimer),
+    %% Lazy re-arm: fire when the connection would actually be idle for
+    %% Timeout, measured from last_activity. At the initial arm
+    %% last_activity = Now, so this is the full timeout; a spurious-fire
+    %% re-arm is the remaining time, not a fresh full timeout.
+    Now = erlang:monotonic_time(millisecond),
+    Delay = max(0, (LastActivity + Timeout) - Now),
     Ref = make_ref(),
-    erlang:send_after(Timeout, self(), {idle_timeout, Ref}),
+    erlang:send_after(Delay, self(), {idle_timeout, Ref}),
     State#state{idle_timer = Ref}.
 
 %%====================================================================
@@ -8371,12 +8377,17 @@ set_keep_alive_timer(#state{keep_alive_interval = disabled} = State) ->
 set_keep_alive_timer(
     #state{
         keep_alive_interval = Interval,
-        keep_alive_timer = OldTimer
+        keep_alive_timer = OldTimer,
+        last_activity = LastActivity
     } = State
 ) ->
     cancel_timer(OldTimer),
+    %% Lazy re-arm against last_activity (same model as the idle timer):
+    %% full interval on the initial arm, the remainder on a spurious fire.
+    Now = erlang:monotonic_time(millisecond),
+    Delay = max(0, (LastActivity + Interval) - Now),
     Ref = make_ref(),
-    erlang:send_after(Interval, self(), {keep_alive_timeout, Ref}),
+    erlang:send_after(Delay, self(), {keep_alive_timeout, Ref}),
     State#state{keep_alive_timer = Ref}.
 
 %%====================================================================
@@ -8423,7 +8434,9 @@ state_to_map(#state{} = S) ->
         max_data_local => S#state.max_data_local,
         fc_last_stream_update => S#state.fc_last_stream_update,
         fc_last_conn_update => S#state.fc_last_conn_update,
-        fc_max_receive_window => S#state.fc_max_receive_window
+        fc_max_receive_window => S#state.fc_max_receive_window,
+        idle_timer_armed => S#state.idle_timer =/= undefined,
+        keep_alive_timer_armed => S#state.keep_alive_timer =/= undefined
     }.
 
 %% Send-path observability helpers. Each reads one field from the

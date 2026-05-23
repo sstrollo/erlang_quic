@@ -694,3 +694,42 @@ ack_classify_recv_trigger_test() ->
     ?assertEqual(reordered, quic_connection:test_classify_recv_trigger(9, 6)),
     ?assertEqual(reordered, quic_connection:test_classify_recv_trigger(3, 6)),
     ?assertEqual(reordered, quic_connection:test_classify_recv_trigger(6, 6)).
+
+%%====================================================================
+%% Lazy timer arming (idle / keep-alive)
+%%====================================================================
+
+%% The idle timer is armed once at connection setup (it re-arms itself
+%% lazily from last_activity), so it must be present even in the idle
+%% state before any handshake.
+idle_timer_armed_at_init_test() ->
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, #{}, self()),
+    {idle, Info} = quic_connection:get_state(Pid),
+    ?assert(maps:get(idle_timer_armed, Info)),
+    quic_connection:close(Pid, normal),
+    timer:sleep(100).
+
+%% idle_timeout = 0 disables the idle timer entirely.
+idle_timer_not_armed_when_zero_test() ->
+    Opts = #{idle_timeout => 0},
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, Opts, self()),
+    {idle, Info} = quic_connection:get_state(Pid),
+    ?assertNot(maps:get(idle_timer_armed, Info)),
+    quic_connection:close(Pid, normal),
+    timer:sleep(100).
+
+%% The keep-alive timer must NOT be armed before the connection reaches the
+%% connected state: its handler only runs in `connected', and a fire in any
+%% other state is dropped without re-arming. Arming it at init would let a
+%% handshake longer than one keep-alive interval lose the timer for good, so
+%% it is armed at the connected transition instead. In the idle state a
+%% keep-alive-enabled connection therefore has the idle timer armed but the
+%% keep-alive timer still unarmed.
+keep_alive_not_armed_before_connected_test() ->
+    Opts = #{keep_alive_interval => 5000, idle_timeout => 30000},
+    {ok, Pid} = quic_connection:start_link("127.0.0.1", 4433, Opts, self()),
+    {idle, Info} = quic_connection:get_state(Pid),
+    ?assert(maps:get(idle_timer_armed, Info)),
+    ?assertNot(maps:get(keep_alive_timer_armed, Info)),
+    quic_connection:close(Pid, normal),
+    timer:sleep(100).
