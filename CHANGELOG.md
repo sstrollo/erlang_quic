@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-05-23
+
+### Changed
+- Idle and keep-alive timers are now lazy: armed once at connection setup and re-armed only when they fire, from the `last_activity` timestamp, instead of being cancelled and rescheduled on every packet. (#140)
+- HTTP/3 responses coalesce the HEADERS frame with the first DATA frame, so a response's headers and first body bytes go out in one 1-RTT packet instead of two. A large body still fragments as before. (#141)
+
 ## [1.4.0] - 2026-05-22
 
 ### Added
