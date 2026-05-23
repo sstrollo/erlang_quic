@@ -381,7 +381,8 @@ make_test_state(Overrides) ->
         h3_datagram_enabled => false,
         peer_h3_datagram_enabled => false,
         bidi_type_buffers => #{},
-        claimed_bidi_streams => #{}
+        claimed_bidi_streams => #{},
+        pending_response_headers => #{}
     },
     Merged = maps:merge(Default, Overrides),
     {state, maps:get(quic_conn, Merged), maps:get(quic_ref, Merged), maps:get(role, Merged),
@@ -408,4 +409,4 @@ make_test_state(Overrides) ->
         maps:get(local_connect_enabled, Merged), maps:get(stream_type_handler, Merged),
         maps:get(claimed_uni_streams, Merged), maps:get(h3_datagram_enabled, Merged),
         maps:get(peer_h3_datagram_enabled, Merged), maps:get(bidi_type_buffers, Merged),
-        maps:get(claimed_bidi_streams, Merged)}.
+        maps:get(claimed_bidi_streams, Merged), maps:get(pending_response_headers, Merged)}.

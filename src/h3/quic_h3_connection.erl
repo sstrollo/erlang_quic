@@ -253,7 +253,12 @@
 
     %% Bidi streams the stream_type_handler claimed; maps StreamId to
     %% the advertised varint type.
-    claimed_bidi_streams = #{} :: #{stream_id() => non_neg_integer()}
+    claimed_bidi_streams = #{} :: #{stream_id() => non_neg_integer()},
+
+    %% Final-response HEADERS frames buffered until the first body chunk so
+    %% they coalesce into one QUIC packet (StreamId -> encoded HEADERS frame).
+    %% Placed at the end so prior tuple positions stay stable for tests.
+    pending_response_headers = #{} :: #{stream_id() => binary()}
 }).
 
 %%====================================================================
@@ -3244,7 +3249,6 @@ do_send_response(
     Status,
     Headers,
     #state{
-        quic_conn = QuicConn,
         qpack_encoder = Encoder,
         streams = Streams
     } = State
@@ -3264,31 +3268,59 @@ do_send_response(
                     State1 = State#state{qpack_encoder = Encoder1},
                     State2 = send_encoder_instructions(State1),
                     HeadersFrame = quic_h3_frame:encode_headers(Encoded),
-                    case quic:send_data(QuicConn, StreamId, HeadersFrame, false) of
-                        ok ->
-                            Stream1 = Stream#h3_stream{status = Status, headers = AllHeaders},
-                            State3 = State2#state{streams = Streams#{StreamId => Stream1}},
-                            {ok, State3};
-                        {error, Reason} ->
-                            {error, Reason}
-                    end;
+                    Stream1 = Stream#h3_stream{status = Status, headers = AllHeaders},
+                    finish_send_response(StreamId, Status, HeadersFrame, Stream1, State2);
                 error ->
                     {error, unknown_stream}
             end
     end.
 
-do_send_data(StreamId, Data, Fin, #state{quic_conn = QuicConn, streams = Streams} = State) ->
+%% Final response (>= 200): buffer the HEADERS so they coalesce into the same
+%% QUIC packet as the first body chunk (flushed by do_send_data/4 or
+%% do_send_trailers/3). The QPACK encoder instructions were already sent,
+%% preserving RFC 9204 ordering. Informational (1xx) responses are sent
+%% promptly and never buffered.
+finish_send_response(StreamId, Status, HeadersFrame, Stream1, State) when Status >= 200 ->
+    Pending = maps:put(StreamId, HeadersFrame, State#state.pending_response_headers),
+    {ok, State#state{
+        streams = (State#state.streams)#{StreamId => Stream1},
+        pending_response_headers = Pending
+    }};
+finish_send_response(StreamId, _Status, HeadersFrame, Stream1, State) ->
+    case quic:send_data(State#state.quic_conn, StreamId, HeadersFrame, false) of
+        ok ->
+            {ok, State#state{streams = (State#state.streams)#{StreamId => Stream1}}};
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+do_send_data(
+    StreamId,
+    Data,
+    Fin,
+    #state{quic_conn = QuicConn, streams = Streams, pending_response_headers = Pending} = State
+) ->
     case maps:find(StreamId, Streams) of
         {ok, Stream} ->
             DataFrame = quic_h3_frame:encode_data(Data),
-            case quic:send_data(QuicConn, StreamId, DataFrame, Fin) of
+            %% Prepend any buffered response HEADERS so HEADERS + first body
+            %% chunk ride in one QUIC packet.
+            {Payload, Pending1} =
+                case maps:take(StreamId, Pending) of
+                    {HeadersFrame, P1} -> {<<HeadersFrame/binary, DataFrame/binary>>, P1};
+                    error -> {DataFrame, Pending}
+                end,
+            case quic:send_data(QuicConn, StreamId, Payload, Fin) of
                 ok ->
                     Stream1 =
                         case Fin of
                             true -> Stream#h3_stream{state = half_closed_local};
                             false -> Stream
                         end,
-                    {ok, State#state{streams = Streams#{StreamId => Stream1}}};
+                    {ok, State#state{
+                        streams = Streams#{StreamId => Stream1},
+                        pending_response_headers = Pending1
+                    }};
                 {error, Reason} ->
                     {error, Reason}
             end;
@@ -3321,13 +3353,25 @@ do_send_trailers(
                     State1 = State#state{qpack_encoder = Encoder1},
                     State2 = send_encoder_instructions(State1),
                     TrailersFrame = quic_h3_frame:encode_headers(Encoded),
-                    case quic:send_data(QuicConn, StreamId, TrailersFrame, true) of
+                    %% Flush any still-buffered response HEADERS ahead of the
+                    %% trailers (a response with HEADERS + trailers but no body).
+                    {Payload, Pending1} =
+                        case maps:take(StreamId, State2#state.pending_response_headers) of
+                            {HeadersFrame, P1} ->
+                                {<<HeadersFrame/binary, TrailersFrame/binary>>, P1};
+                            error ->
+                                {TrailersFrame, State2#state.pending_response_headers}
+                        end,
+                    case quic:send_data(QuicConn, StreamId, Payload, true) of
                         ok ->
                             Stream1 = Stream#h3_stream{
                                 trailers = Trailers,
                                 state = half_closed_local
                             },
-                            State3 = State2#state{streams = Streams#{StreamId => Stream1}},
+                            State3 = State2#state{
+                                streams = Streams#{StreamId => Stream1},
+                                pending_response_headers = Pending1
+                            },
                             {ok, State3};
                         {error, Reason} ->
                             {error, Reason}
@@ -3337,11 +3381,19 @@ do_send_trailers(
             end
     end.
 
-do_cancel_stream(StreamId, ErrorCode, #state{quic_conn = QuicConn, streams = Streams} = State) ->
+do_cancel_stream(
+    StreamId,
+    ErrorCode,
+    #state{quic_conn = QuicConn, streams = Streams, pending_response_headers = Pending} = State
+) ->
     quic:reset_stream(QuicConn, StreamId, ErrorCode),
     %% RFC 9204 Section 4.4.2: Send Stream Cancellation if stream was blocked
     State1 = maybe_send_stream_cancel(StreamId, State),
-    State1#state{streams = maps:remove(StreamId, Streams)}.
+    %% Drop any buffered (unsent) HEADERS for the cancelled stream.
+    State1#state{
+        streams = maps:remove(StreamId, Streams),
+        pending_response_headers = maps:remove(StreamId, Pending)
+    }.
 
 %%====================================================================
 %% Internal: Per-stream Handler Registration

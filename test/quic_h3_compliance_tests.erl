@@ -2353,6 +2353,7 @@ make_test_state(Overrides) ->
         goaway_id => undefined,
         last_stream_id => 0,
         streams => #{},
+        pending_response_headers => #{},
         next_stream_id => 0,
         stream_buffers => #{},
         uni_stream_buffers => #{},
@@ -2418,4 +2419,5 @@ make_test_state(Overrides) ->
         maps:get(stream_buffer_limit, Merged), maps:get(local_connect_enabled, Merged),
         maps:get(stream_type_handler, Merged), maps:get(claimed_uni_streams, Merged),
         maps:get(h3_datagram_enabled, Merged), maps:get(peer_h3_datagram_enabled, Merged),
-        maps:get(bidi_type_buffers, Merged), maps:get(claimed_bidi_streams, Merged)}.
+        maps:get(bidi_type_buffers, Merged), maps:get(claimed_bidi_streams, Merged),
+        maps:get(pending_response_headers, Merged)}.
