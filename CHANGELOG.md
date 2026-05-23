@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.4.2] - 2026-05-23
+
+### Fixed
+- HTTP/3 extended CONNECT (RFC 9220) regressed in 1.4.1: the response-HEADERS coalescing introduced in 1.4.1 buffered a CONNECT tunnel's `200` until the first DATA frame, but a tunnel server sends no DATA until the client does and the client waits for the `200`, so the tunnel deadlocked (WebTransport and WebSocket-over-H3). CONNECT responses now flush the `200` immediately; plain H3 responses still coalesce headers with the first body chunk.
+
 ## [1.4.1] - 2026-05-23
 
 ### Changed
