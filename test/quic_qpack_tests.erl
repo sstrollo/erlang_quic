@@ -124,6 +124,29 @@ encode_response_headers_bytes_test() ->
     ?assertEqual(<<16#00, 16#00, 16#D9, 16#54, 16#01, 16#31>>, Encoded).
 
 %%====================================================================
+%% Field Section Prefix Base reconstruction (RFC 9204 Section 4.5.1.2)
+%%
+%%   if Sign == 0: Base = ReqInsertCount + DeltaBase
+%%   else:         Base = ReqInsertCount - DeltaBase - 1
+%%====================================================================
+
+decode_base_sign_zero_test() ->
+    %% S=0: Base = Required Insert Count + Delta Base.
+    ?assertEqual(13, quic_qpack:decode_base(0, 10, 3)).
+
+decode_base_sign_one_test() ->
+    %% S=1: Base = Required Insert Count - Delta Base - 1.
+    ?assertEqual(6, quic_qpack:decode_base(1, 10, 3)).
+
+decode_base_static_only_test() ->
+    %% Static-only prefix (00 00): RIC=0, S=0, DeltaBase=0 -> Base=0.
+    ?assertEqual(0, quic_qpack:decode_base(0, 0, 0)).
+
+decode_base_sign_one_boundary_test() ->
+    %% S=1 with DeltaBase=0 -> Base = RIC - 1.
+    ?assertEqual(4, quic_qpack:decode_base(1, 5, 0)).
+
+%%====================================================================
 %% Literal Header Tests
 %%====================================================================
 
