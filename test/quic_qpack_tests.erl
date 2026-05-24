@@ -216,6 +216,70 @@ dynamic_table_capacity_test() ->
     ?assertEqual(0, quic_qpack:get_insert_count(State)).
 
 %%====================================================================
+%% Dynamic Table round-trip (encoder stream + field section)
+%%
+%% Full flow: encode (insert + literal) -> feed encoder instructions to
+%% the decoder -> acknowledge -> re-encode (dynamic reference) -> decode.
+%%====================================================================
+
+%% Insert one entry, acknowledge it, then reference it (RIC = insert_count).
+dynamic_reference_newest_roundtrip_test() ->
+    H = [{<<"x-custom">>, <<"value">>}],
+    E0 = quic_qpack:new(#{max_dynamic_size => 4096}),
+    D0 = quic_qpack:new(#{max_dynamic_size => 4096}),
+    {_Literal, E1} = quic_qpack:encode(H, 0, E0),
+    {ok, D1} = quic_qpack:process_encoder_instructions(
+        quic_qpack:get_encoder_instructions(E1), D0
+    ),
+    {ok, E2} = quic_qpack:process_decoder_instructions(
+        quic_qpack:encode_insert_count_increment(1), quic_qpack:clear_encoder_instructions(E1)
+    ),
+    {Ref, _E3} = quic_qpack:encode(H, 4, E2),
+    %% The re-encode is a dynamic Indexed Field Line (10xxxxxx) after the
+    %% 2-byte prefix, not another literal.
+    <<_Prefix:2/binary, Tag:2, _/bitstring>> = Ref,
+    ?assertEqual(2#10, Tag),
+    ?assertEqual({ok, H}, element(1, quic_qpack:decode(Ref, D1))).
+
+%% Reference a NON-newest entry (RIC < insert_count). The field section must
+%% signal Base = insert_count (DeltaBase = insert_count - RIC); signalling
+%% Base = RIC made the decoder resolve the wrong absolute index.
+dynamic_reference_older_entry_roundtrip_test() ->
+    A = {<<"a">>, <<"1">>},
+    B = {<<"b">>, <<"2">>},
+    E0 = quic_qpack:new(#{max_dynamic_size => 4096}),
+    D0 = quic_qpack:new(#{max_dynamic_size => 4096}),
+    {_, E1} = quic_qpack:encode([A], 0, E0),
+    {ok, D1} = quic_qpack:process_encoder_instructions(
+        quic_qpack:get_encoder_instructions(E1), D0
+    ),
+    {_, E2} = quic_qpack:encode([B], 4, quic_qpack:clear_encoder_instructions(E1)),
+    {ok, D2} = quic_qpack:process_encoder_instructions(
+        quic_qpack:get_encoder_instructions(E2), D1
+    ),
+    {ok, E3} = quic_qpack:process_decoder_instructions(
+        quic_qpack:encode_insert_count_increment(2), quic_qpack:clear_encoder_instructions(E2)
+    ),
+    {Ref, _E4} = quic_qpack:encode([A], 8, E3),
+    ?assertEqual({ok, [A]}, element(1, quic_qpack:decode(Ref, D2))).
+
+%% A field section that arrives before its encoder-stream inserts decodes as
+%% {blocked, RIC}; once the inserts are processed, the retry succeeds.
+dynamic_blocked_stream_recovery_test() ->
+    H = [{<<"x-custom">>, <<"value">>}],
+    E0 = quic_qpack:new(#{max_dynamic_size => 4096}),
+    D0 = quic_qpack:new(#{max_dynamic_size => 4096}),
+    {_, E1} = quic_qpack:encode(H, 0, E0),
+    Instr = quic_qpack:get_encoder_instructions(E1),
+    {ok, E2} = quic_qpack:process_decoder_instructions(
+        quic_qpack:encode_insert_count_increment(1), quic_qpack:clear_encoder_instructions(E1)
+    ),
+    {Ref, _E3} = quic_qpack:encode(H, 4, E2),
+    ?assertMatch({blocked, 1}, element(1, quic_qpack:decode(Ref, D0))),
+    {ok, D1} = quic_qpack:process_encoder_instructions(Instr, D0),
+    ?assertEqual({ok, H}, element(1, quic_qpack:decode(Ref, D1))).
+
+%%====================================================================
 %% Huffman Encoding Tests
 %%====================================================================
 
