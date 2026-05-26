@@ -140,6 +140,65 @@ connect(Port, Opts0) ->
     end.
 
 %%====================================================================
+%% HTTP/3 client inherits the same verification
+%%====================================================================
+
+h3_verification_test_() ->
+    {setup, fun h3_setup/0, fun h3_cleanup/1, fun(Ctx) ->
+        case Ctx of
+            skip ->
+                [];
+            #{port := Port, cert := Cert} ->
+                [
+                    {"h3 verify_none connects",
+                        {timeout, 30,
+                            ?_assertEqual(connected, h3_connect(Port, #{verify => verify_none}))}},
+                    {"h3 verify_peer with the right anchor connects",
+                        {timeout, 30,
+                            ?_assertEqual(
+                                connected,
+                                h3_connect(Port, #{verify => verify_peer, cacerts => [Cert]})
+                            )}},
+                    {"h3 verify_peer without a trust anchor is rejected",
+                        {timeout, 30,
+                            ?_assertMatch(
+                                {error, _}, h3_connect(Port, #{verify => verify_peer})
+                            )}}
+                ]
+        end
+    end}.
+
+h3_setup() ->
+    case gen_cert("/CN=localhost", "subjectAltName=DNS:localhost,IP:127.0.0.1") of
+        {ok, Cert, Key} ->
+            {ok, _} = application:ensure_all_started(quic),
+            Name = list_to_atom("quic_h3_verify_" ++ suffix()),
+            {ok, _} = quic_h3:start_server(Name, 0, #{cert => Cert, key => Key}),
+            {ok, Port} = quic:get_server_port(Name),
+            #{name => Name, port => Port, cert => Cert};
+        {error, _} ->
+            skip
+    end.
+
+h3_cleanup(skip) ->
+    ok;
+h3_cleanup(#{name := Name}) ->
+    catch quic:stop_server(Name),
+    ok.
+
+%% Connect over HTTP/3 to localhost and report whether the handshake
+%% completed. `server_name' is set by quic_h3 to the connect host.
+h3_connect(Port, Opts0) ->
+    Opts = Opts0#{sync => true, connect_timeout => ?CONNECT_TIMEOUT},
+    case quic_h3:connect("localhost", Port, Opts) of
+        {ok, Conn} ->
+            catch quic_h3:close(Conn),
+            connected;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%%====================================================================
 %% Helpers
 %%====================================================================
 
