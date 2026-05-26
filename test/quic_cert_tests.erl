@@ -140,6 +140,52 @@ connect(Port, Opts0) ->
     end.
 
 %%====================================================================
+%% Anti-amplification (RFC 9000 8.1): a server whose first flight
+%% exceeds 3x the bytes received must defer the excess and still
+%% complete the handshake once the client re-sends its Initial.
+%%====================================================================
+
+amplification_test_() ->
+    {setup, fun amp_setup/0, fun cleanup/1, fun(Ctx) ->
+        case Ctx of
+            skip ->
+                [];
+            #{port := Port} ->
+                [
+                    %% The server defers the part of its flight that exceeds 3x
+                    %% the bytes received; the handshake still completes once the
+                    %% client's Handshake packet validates the address (RFC 9000
+                    %% 8.1) and the deferred flight is flushed.
+                    {"large server flight (> 3x) still completes the handshake",
+                        {timeout, 30, ?_assertEqual(connected, connect(Port, #{verify => false}))}}
+                ]
+        end
+    end}.
+
+amp_setup() ->
+    case gen_cert("/CN=localhost", "subjectAltName=DNS:localhost,IP:127.0.0.1") of
+        {ok, Cert, Key} ->
+            %% Inflate the server's first flight past 3 x 1200 bytes with a
+            %% padding chain (unrelated self-signed certs; the client uses
+            %% verify => false so the chain need not validate). This forces
+            %% the server to defer part of the flight under the budget.
+            Chain = [
+                C
+             || {ok, C, _} <- [
+                    gen_cert("/CN=pad", "subjectAltName=DNS:pad")
+                 || _ <- lists:seq(1, 4)
+                ]
+            ],
+            {ok, _} = application:ensure_all_started(quic),
+            {ok, Server} = quic_test_echo_server:start(#{
+                cert => Cert, key => Key, cert_chain => Chain
+            }),
+            (maps:merge(#{cert => Cert}, Server))#{server => Server};
+        {error, _} ->
+            skip
+    end.
+
+%%====================================================================
 %% HTTP/3 client inherits the same verification
 %%====================================================================
 

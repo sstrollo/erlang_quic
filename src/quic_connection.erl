@@ -198,6 +198,17 @@
 %% Max pending data entries before connection is established (prevents memory exhaustion)
 -define(MAX_PENDING_DATA_ENTRIES, 1000).
 
+%% Client Initial retransmission while the handshake has not completed.
+%% Recovers a stalled handshake, including the case where a server defers
+%% part of its flight under the anti-amplification limit (RFC 9000 §8.1):
+%% re-sending the (padded) Initial lifts the server's received-byte budget
+%% so it can flush the deferred flight. Backoff doubles from the base up
+%% to the cap. Localhost handshakes complete well under the base, so the
+%% timer is cancelled by the state change and never fires.
+-define(HS_RTX_BASE_MS, 500).
+-define(HS_RTX_MAX_MS, 4000).
+-define(HS_RTX_MAX_ATTEMPTS, 8).
+
 %% Max send queue size in bytes (16 MB default) - prevents memory exhaustion from queued data
 -define(MAX_SEND_QUEUE_BYTES, 16777216).
 
@@ -217,6 +228,13 @@
 %% Max receive buffer size in bytes (32 MB total across all streams) - protects against malicious peers
 -define(MAX_RECV_BUFFER_BYTES, 33554432).
 
+%% Per-level cap on out-of-order CRYPTO reassembly (RFC 9000 §7.5). A
+%% legitimate handshake flight is a few KB; bound buffered bytes and the
+%% number of out-of-order fragments so a peer cannot grow memory before
+%% the handshake completes. Over-limit closes with CRYPTO_BUFFER_EXCEEDED.
+-define(MAX_CRYPTO_BUFFER_BYTES, 262144).
+-define(MAX_CRYPTO_BUFFER_ENTRIES, 2048).
+
 %% Connection state record
 -record(state, {
     %% Connection identity
@@ -233,6 +251,18 @@
     %% client's Initial token (and by implication its source address),
     %% the per-connection Initial-token validator skips its recheck.
     address_validated = false :: boolean(),
+    %% RFC 9000 §8.1 anti-amplification (server, pre-validation). Cap
+    %% bytes sent to <= 3x bytes received until the peer's address is
+    %% validated; datagrams over budget are deferred (held verbatim) and
+    %% flushed when more is received or the address becomes validated.
+    amp_rx = 0 :: non_neg_integer(),
+    amp_tx = 0 :: non_neg_integer(),
+    amp_deferred = [] :: [iodata()],
+    %% Client-side: the Initial CRYPTO frame (ClientHello) buffered so a
+    %% stalled handshake can re-send it, and the retransmission attempt
+    %% count for backoff. See ?HS_RTX_* and retransmit_initial_flight/1.
+    initial_crypto_frame :: binary() | undefined,
+    hs_rtx_attempts = 0 :: non_neg_integer(),
     %% Server-side only. The Retry SCID to echo back as
     %% retry_source_connection_id (RFC 9000 §7.3) when this connection
     %% was spawned from a retried Initial.
@@ -1529,10 +1559,12 @@ code_change(_OldVsn, StateName, State, _Extra) ->
 idle(enter, _OldState, #state{role = client} = State) ->
     %% Client: Start the handshake by sending Initial packet with ClientHello
     NewState = send_client_hello(State),
-    {keep_state, NewState};
+    {keep_state, NewState, hs_rtx_actions(NewState)};
 idle(enter, _OldState, #state{role = server} = State) ->
     %% Server: Wait for Initial packet with ClientHello
     {keep_state, State};
+idle(state_timeout, retransmit_initial, State) ->
+    retransmit_initial_flight(idle, State);
 idle({call, From}, get_ref, #state{conn_ref = Ref} = State) ->
     {keep_state, State, [{reply, From, Ref}]};
 idle({call, From}, get_state, State) ->
@@ -1613,8 +1645,11 @@ idle(EventType, EventContent, State) ->
 %% ----- HANDSHAKING STATE -----
 
 handshaking(enter, idle, State) ->
-    %% Continue handshake
-    {keep_state, State};
+    %% Continue handshake; (re)arm the client Initial-retransmission timer
+    %% (no-op for the server).
+    {keep_state, State, hs_rtx_actions(State)};
+handshaking(state_timeout, retransmit_initial, State) ->
+    retransmit_initial_flight(handshaking, State);
 handshaking({call, From}, get_ref, #state{conn_ref = Ref} = State) ->
     {keep_state, State, [{reply, From, Ref}]};
 handshaking({call, From}, get_state, State) ->
@@ -2439,6 +2474,7 @@ send_client_hello(State) ->
         tls_transcript = Transcript,
         tls_ch1_random = ClientRandom,
         tls_ch1_opts = ClientHelloOpts,
+        initial_crypto_frame = CryptoFrame,
         initial_tx_off = byte_size(ClientHello),
         early_keys = EarlyKeys,
         max_early_data =
@@ -3037,8 +3073,8 @@ send_initial_packet(Payload, State) ->
     %% Pad Initial packets to at least 1200 bytes
     PaddedPacket = pad_initial_packet(Packet),
 
-    %% Send
-    NewSocketState = send_and_take_socket_state(PaddedPacket, State),
+    %% Send (subject to the anti-amplification budget on the server).
+    State1 = amp_send(PaddedPacket, State),
 
     %% Emit qlog packet_sent event
     quic_qlog:packet_sent(State#state.qlog_ctx, #{
@@ -3049,10 +3085,9 @@ send_initial_packet(Payload, State) ->
 
     %% Update packet number space and packet counter
     NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
-    State#state{
+    State1#state{
         pn_initial = NewPNSpace,
-        packets_sent = State#state.packets_sent + 1,
-        socket_state = NewSocketState
+        packets_sent = State1#state.packets_sent + 1
     }.
 
 %% Send an Initial ACK packet
@@ -3250,7 +3285,7 @@ send_handshake_packet(Payload, State) ->
     Packet = quic_aead:protect_long_packet(
         Cipher, Key, IV, HP, PN, HeaderPrefix, PaddedPayload
     ),
-    NewSocketState = send_and_take_socket_state(Packet, State),
+    State1 = amp_send(Packet, State),
 
     %% Emit qlog packet_sent event
     quic_qlog:packet_sent(State#state.qlog_ctx, #{
@@ -3261,10 +3296,9 @@ send_handshake_packet(Payload, State) ->
 
     %% Update PN space and packet counter
     NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
-    State#state{
+    State1#state{
         pn_handshake = NewPNSpace,
-        packets_sent = State#state.packets_sent + 1,
-        socket_state = NewSocketState
+        packets_sent = State1#state.packets_sent + 1
     }.
 
 %% Send a 1-RTT (application) packet with a single frame (avoid encode/decode roundtrip)
@@ -3476,7 +3510,114 @@ contains_non_probing_frame([Frame | Rest]) ->
 
 %% Handle incoming packet (may be coalesced with multiple QUIC packets)
 handle_packet(Data, State) ->
-    handle_packet_loop(Data, State).
+    %% RFC 9000 §8.1: count every received byte toward the
+    %% anti-amplification budget, then flush any flight we had to defer
+    %% once the budget (or address validation) allows.
+    State1 = amp_account_recv(Data, State),
+    State2 = handle_packet_loop(Data, State1),
+    amp_flush(State2).
+
+%% Server-side anti-amplification accounting/gating (RFC 9000 §8.1).
+amp_account_recv(Data, #state{role = server, address_validated = false} = State) ->
+    State#state{amp_rx = State#state.amp_rx + byte_size(Data)};
+amp_account_recv(_Data, State) ->
+    State.
+
+%% Send a pre-handshake datagram subject to the 3x budget. Over-budget
+%% datagrams are deferred verbatim and flushed later. Returns the updated
+%% state (socket_state / amp counters / deferred queue threaded in).
+amp_send(Packet, #state{role = server, address_validated = false} = State) ->
+    Size = erlang:iolist_size(Packet),
+    case (State#state.amp_tx + Size) =< (3 * State#state.amp_rx) of
+        true ->
+            SocketState = send_and_take_socket_state(Packet, State),
+            State#state{socket_state = SocketState, amp_tx = State#state.amp_tx + Size};
+        false ->
+            State#state{amp_deferred = State#state.amp_deferred ++ [Packet]}
+    end;
+amp_send(Packet, State) ->
+    State#state{socket_state = send_and_take_socket_state(Packet, State)}.
+
+%% Mark the peer address validated once a server decrypts a Handshake
+%% packet from it (RFC 9000 §8.1) — lifts the amplification limit.
+amp_mark_validated(handshake, #state{role = server, address_validated = false} = State) ->
+    State#state{address_validated = true};
+amp_mark_validated(_Type, State) ->
+    State.
+
+%% Flush deferred datagrams. Once validated, send all; otherwise send
+%% only what the current budget covers (in order).
+amp_flush(#state{amp_deferred = []} = State) ->
+    State;
+amp_flush(#state{address_validated = true, amp_deferred = Pending} = State) ->
+    Flushed = lists:foldl(
+        fun(Packet, S) ->
+            S#state{
+                socket_state = send_and_take_socket_state(Packet, S),
+                amp_tx = S#state.amp_tx + erlang:iolist_size(Packet)
+            }
+        end,
+        State,
+        Pending
+    ),
+    Flushed#state{amp_deferred = []};
+amp_flush(#state{role = server} = State) ->
+    amp_flush_budget(State);
+amp_flush(State) ->
+    State.
+
+amp_flush_budget(#state{amp_deferred = []} = State) ->
+    State;
+amp_flush_budget(#state{amp_deferred = [Packet | Rest]} = State) ->
+    Size = erlang:iolist_size(Packet),
+    case (State#state.amp_tx + Size) =< (3 * State#state.amp_rx) of
+        true ->
+            amp_flush_budget(State#state{
+                socket_state = send_and_take_socket_state(Packet, State),
+                amp_tx = State#state.amp_tx + Size,
+                amp_deferred = Rest
+            });
+        false ->
+            State
+    end.
+
+%% State-timeout action driving client Initial retransmission while the
+%% handshake is incomplete. Empty for the server, once connected, or once
+%% the attempt budget is spent (the idle timeout then closes).
+hs_rtx_actions(#state{
+    role = client,
+    app_keys = undefined,
+    initial_crypto_frame = Frame,
+    hs_rtx_attempts = Attempts
+}) when Frame =/= undefined, Attempts < ?HS_RTX_MAX_ATTEMPTS ->
+    Delay = min(?HS_RTX_BASE_MS bsl Attempts, ?HS_RTX_MAX_MS),
+    [{state_timeout, Delay, retransmit_initial}];
+hs_rtx_actions(_State) ->
+    [].
+
+%% Re-send the buffered Initial (ClientHello) on a stalled handshake and
+%% re-arm the backoff timer. Re-sending the padded Initial also lifts a
+%% server's anti-amplification budget so it can flush a deferred flight.
+retransmit_initial_flight(
+    StateName,
+    #state{role = client, app_keys = undefined, initial_crypto_frame = Frame} = State
+) when Frame =/= undefined ->
+    ?LOG_DEBUG(
+        #{
+            what => handshake_initial_retransmit,
+            state => StateName,
+            attempt => State#state.hs_rtx_attempts + 1
+        },
+        ?QUIC_LOG_META
+    ),
+    State1 = send_initial_packet(Frame, State#state{
+        hs_rtx_attempts = State#state.hs_rtx_attempts + 1
+    }),
+    Flushed = flush_dirty_timers(flush_socket_batch(State1)),
+    client_rearm_active(Flushed, Flushed#state.active_n),
+    {keep_state, Flushed, hs_rtx_actions(Flushed)};
+retransmit_initial_flight(_StateName, State) ->
+    {keep_state, State}.
 
 %% Handle batch of packets from GRO - process all without re-entering gen_statem
 %% This is more efficient than receiving multiple messages
@@ -3496,7 +3637,23 @@ handle_packet_loop(<<>>, #state{role = server} = State) ->
     %% No more data to process - server socket managed by listener
     State;
 handle_packet_loop(Data, State) ->
-    case decode_and_decrypt_packet(Data, State) of
+    %% Header/frame parsing runs on attacker-controlled bytes before (and
+    %% during) AEAD checks and can raise on truncated/oversized input
+    %% (badmatch, varint throws). Convert any such crash into a dropped
+    %% datagram so a malformed packet can never take down the connection.
+    Decoded =
+        try
+            decode_and_decrypt_packet(Data, State)
+        catch
+            %% Catch-all on purpose: the security invariant is that no
+            %% datagram can crash the process, so we must not depend on
+            %% enumerating every exception shape the parsers can raise.
+            %% Class/Reason are surfaced to the warning log below (no
+            %% stacktrace, to avoid a log-flood vector).
+            ErrClass:ErrReason ->
+                {error, {malformed, ErrClass, ErrReason}}
+        end,
+    case Decoded of
         {ok, Type, Frames, RemainingData, NewState, processed} ->
             %% Frames already processed by streaming decode
             ?QLOG_EMIT_PACKET_RECEIVED(NewState#state.qlog_ctx, #{
@@ -3512,7 +3669,7 @@ handle_packet_loop(Data, State) ->
             ?QLOG_EMIT_FRAMES_PROCESSED(NewState1#state.qlog_ctx, Frames),
 
             %% Send ACK if packet contained ack-eliciting frames
-            State2 = maybe_send_ack(Type, Frames, NewState1),
+            State2 = amp_mark_validated(Type, maybe_send_ack(Type, Frames, NewState1)),
             %% Continue with remaining coalesced packets
             handle_packet_loop(RemainingData, State2);
         {ok, Type, Frames, RemainingData, NewState} ->
@@ -3527,7 +3684,7 @@ handle_packet_loop(Data, State) ->
             },
             State1 = process_frames_noreenbl(Type, Frames, NewState1),
             ?QLOG_EMIT_FRAMES_PROCESSED(State1#state.qlog_ctx, Frames),
-            State2 = maybe_send_ack(Type, Frames, State1),
+            State2 = amp_mark_validated(Type, maybe_send_ack(Type, Frames, State1)),
             handle_packet_loop(RemainingData, State2);
         {error, stateless_reset} ->
             %% RFC 9000 Section 10.3: Stateless reset received
@@ -4638,14 +4795,38 @@ buffer_crypto_data(Level, Offset, Data, State) ->
     %% Get current buffer
     Buffer = maps:get(LevelAtom, State#state.crypto_buffer, #{}),
 
-    %% Add data to buffer
-    NewBuffer = maps:put(Offset, Data, Buffer),
-    NewCryptoBuffer = maps:put(LevelAtom, NewBuffer, State#state.crypto_buffer),
+    %% Bound out-of-order CRYPTO reassembly so a peer cannot grow memory
+    %% before the handshake completes (RFC 9000 §7.5). Offsets beyond the
+    %% cap can never become contiguous, so reject them too.
+    BufferedBytes = maps:fold(fun(_, V, Acc) -> Acc + byte_size(V) end, 0, Buffer),
+    Overflow =
+        (Offset > ?MAX_CRYPTO_BUFFER_BYTES) orelse
+            ((BufferedBytes + byte_size(Data)) > ?MAX_CRYPTO_BUFFER_BYTES) orelse
+            (maps:size(Buffer) >= ?MAX_CRYPTO_BUFFER_ENTRIES),
+    case Overflow of
+        true ->
+            ?LOG_WARNING(
+                #{
+                    what => crypto_buffer_exceeded,
+                    level => LevelAtom,
+                    buffered_bytes => BufferedBytes,
+                    entries => maps:size(Buffer)
+                },
+                ?QUIC_LOG_META
+            ),
+            close_with_transport_error(
+                ?QUIC_CRYPTO_BUFFER_EXCEEDED, <<"crypto buffer exceeded">>, State
+            );
+        false ->
+            %% Add data to buffer
+            NewBuffer = maps:put(Offset, Data, Buffer),
+            NewCryptoBuffer = maps:put(LevelAtom, NewBuffer, State#state.crypto_buffer),
 
-    State1 = State#state{crypto_buffer = NewCryptoBuffer},
+            State1 = State#state{crypto_buffer = NewCryptoBuffer},
 
-    %% Try to process contiguous data
-    process_crypto_buffer(LevelAtom, State1).
+            %% Try to process contiguous data
+            process_crypto_buffer(LevelAtom, State1)
+    end.
 
 %% Process contiguous CRYPTO data
 process_crypto_buffer(Level, State) ->
@@ -8105,6 +8286,14 @@ send_tls_alert(AlertCode, Phrase, State) ->
     ErrorCode = ?QUIC_CRYPTO_ERROR_BASE + AlertCode,
     CloseState = State#state{close_reason = {tls_alert, AlertCode}},
     CloseFrame = {connection_close, transport, ErrorCode, 0, Phrase},
+    emit_close_at_level(select_close_level(app, CloseState), CloseFrame, CloseState).
+
+%% Close with a transport-level error code (RFC 9000 §20.1) at the
+%% highest available encryption level. Works before app keys exist
+%% (handshake-time errors) unlike the raw stream-path close.
+close_with_transport_error(Code, Phrase, State) ->
+    CloseState = State#state{close_reason = {transport, Code, Phrase}},
+    CloseFrame = {connection_close, transport, Code, 0, Phrase},
     emit_close_at_level(select_close_level(app, CloseState), CloseFrame, CloseState).
 
 default_alert_phrase(?TLS_ALERT_HANDSHAKE_FAILURE) -> <<"handshake failure">>;
