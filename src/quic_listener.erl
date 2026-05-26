@@ -42,7 +42,9 @@
     start/2,
     stop/1,
     get_port/1,
-    get_connections/1
+    get_connections/1,
+    register_cid/3,
+    retire_cid/2
 ]).
 
 %% gen_server callbacks
@@ -152,6 +154,19 @@ get_port(Listener) ->
 -spec get_connections(pid()) -> [pid()].
 get_connections(Listener) ->
     gen_server:call(Listener, get_connections).
+
+%% @doc Add a connection ID to the routing table. Called by a connection
+%% when it issues a new CID (NEW_CONNECTION_ID) so packets the peer sends
+%% to the rotated/migrated CID reach the connection (the routing ETS is
+%% owned by the listener).
+-spec register_cid(pid(), binary(), pid()) -> ok.
+register_cid(Listener, CID, ConnPid) ->
+    gen_server:cast(Listener, {register_cid, CID, ConnPid}).
+
+%% @doc Remove a connection ID from the routing table (CID retired).
+-spec retire_cid(pid(), binary()) -> ok.
+retire_cid(Listener, CID) ->
+    gen_server:cast(Listener, {retire_cid, CID}).
 
 %%====================================================================
 %% gen_server callbacks
@@ -331,6 +346,12 @@ handle_call(_Request, _From, State) ->
 
 %% @doc false
 -spec handle_cast(term(), state()) -> {noreply, state()}.
+handle_cast({register_cid, CID, ConnPid}, #listener_state{connections = Conns} = State) ->
+    ets:insert(Conns, {CID, ConnPid}),
+    {noreply, State};
+handle_cast({retire_cid, CID}, #listener_state{connections = Conns} = State) ->
+    ets:delete(Conns, CID),
+    {noreply, State};
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
