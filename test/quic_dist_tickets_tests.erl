@@ -15,16 +15,23 @@
 %%====================================================================
 
 setup() ->
-    %% Stop any existing server first
-    catch gen_server:stop(quic_dist_tickets),
-    timer:sleep(10),
-    %% Start the tickets server
-    {ok, Pid} = quic_dist_tickets:start_link(),
-    Pid.
+    %% When the quic application is running, quic_dist_tickets is
+    %% already started under quic_dist_sup. Reuse the supervised
+    %% instance in that case; otherwise start a standalone one.
+    case whereis(quic_dist_tickets) of
+        undefined ->
+            {ok, Pid} = quic_dist_tickets:start_link(),
+            {started, Pid};
+        Pid ->
+            {existing, Pid}
+    end.
 
-cleanup(Pid) ->
-    %% Stop the server
+cleanup({started, Pid}) ->
+    %% We started it, so we own its lifecycle.
     catch gen_server:stop(Pid),
+    ok;
+cleanup({existing, _Pid}) ->
+    %% Supervised by quic_dist_sup; leave it running.
     ok.
 
 %%====================================================================

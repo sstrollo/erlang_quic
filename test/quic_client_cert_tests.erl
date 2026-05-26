@@ -247,6 +247,7 @@ server_verify_client_no_cert_test() ->
                     Port,
                     #{
                         alpn => [<<"h3">>],
+                        verify => false,
                         server_name => <<"server">>
                     },
                     self()
@@ -293,6 +294,7 @@ server_verify_client_with_cert_test() ->
                     Port,
                     #{
                         alpn => [<<"h3">>],
+                        verify => false,
                         server_name => <<"server">>,
                         cert => ClientCert,
                         key => ClientKey
@@ -339,6 +341,7 @@ server_no_verify_test() ->
                     Port,
                     #{
                         alpn => [<<"h3">>],
+                        verify => false,
                         server_name => <<"server">>
                     },
                     self()
@@ -380,6 +383,7 @@ client_peercert_test() ->
                     Port,
                     #{
                         alpn => [<<"h3">>],
+                        verify => false,
                         server_name => <<"server">>
                     },
                     self()
@@ -426,6 +430,7 @@ mutual_tls_data_exchange_test() ->
                     Port,
                     #{
                         alpn => [<<"h3">>],
+                        verify => false,
                         server_name => <<"server">>,
                         cert => ClientCert,
                         key => ClientKey

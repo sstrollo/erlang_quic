@@ -422,7 +422,7 @@ concurrent_streams(Host, Port, Opts) ->
 %% Connect with timeout handling
 connect_with_timeout(Host, Port, Timeout) ->
     %% Client options: ALPN must match server
-    Opts = #{alpn => [<<"bench">>, <<"h3">>]},
+    Opts = #{alpn => [<<"bench">>, <<"h3">>], verify => false},
 
     case quic_connection:connect(Host, Port, Opts, self()) of
         {ok, ConnRef, ConnPid} ->

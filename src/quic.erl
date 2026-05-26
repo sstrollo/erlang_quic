@@ -184,9 +184,14 @@ get_fd(Socket) ->
 %%       and optional `close_fun', `local'. Inbound packets must be
 %%       delivered to the owning connection as `{udp, Socket, IP, Port,
 %%       Data}' messages.</li>
-%%   <li>`verify' - Verify server certificate (default: false)</li>
+%%   <li>`verify' - Validate the server certificate chain, signature
+%%       and hostname (default: `true'). Set to `false' to skip
+%%       validation (e.g. self-signed test servers).</li>
+%%   <li>`cacerts' - Trust anchors as a list of DER-encoded CA
+%%       certificates. Defaults to the OS trust store.</li>
 %%   <li>`alpn' - ALPN protocols (default: [&lt;&lt;"h3"&gt;&gt;])</li>
-%%   <li>`server_name' - Server Name Indication (default: Host)</li>
+%%   <li>`server_name' - Server Name Indication, also the hostname
+%%       checked against the certificate (default: Host)</li>
 %%   <li>`external_psk' - TLS 1.3 external PSK (RFC 8446 §4.2.11).
 %%       `{Identity, Secret}' defaults to modes `[psk_dhe_ke]';
 %%       `{Identity, Secret, Modes}' takes an explicit non-empty

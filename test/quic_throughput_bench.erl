@@ -488,6 +488,7 @@ run_client_benchmark(Port, DataSize, RecvBuf, SndBuf, Mode, ClientExtra) ->
     ClientOpts = maps:merge(
         #{
             alpn => [<<"bench">>],
+            verify => false,
             recbuf => RecvBuf,
             sndbuf => SndBuf,
             max_data => FlowWindow,

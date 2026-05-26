@@ -171,6 +171,7 @@ run_single_benchmark(Host, Port, Size, Direction, Iterations) ->
     FlowWindow = 16777216,
     ClientOpts = #{
         alpn => [<<"bench">>],
+        verify => false,
         recbuf => 7340032,
         sndbuf => 7340032,
         max_data => FlowWindow,
@@ -279,6 +280,7 @@ run_persistent_benchmark(Host, Port, Size, Direction, Iterations) ->
     FlowWindow = 16777216,
     ClientOpts = #{
         alpn => [<<"bench">>],
+        verify => false,
         recbuf => 7340032,
         sndbuf => 7340032,
         max_data => FlowWindow,

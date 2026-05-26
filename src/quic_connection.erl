@@ -267,6 +267,8 @@
     %% Options
     server_name :: binary() | undefined,
     verify :: boolean(),
+    %% Trust anchors (DER) for server cert validation; undefined = OS store
+    cacerts :: [binary()] | undefined,
 
     %% Encryption keys per level
     initial_keys :: {#crypto_keys{}, #crypto_keys{}} | undefined,
@@ -1372,7 +1374,8 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         owner = Owner,
         conn_ref = ConnRef,
         server_name = ServerName,
-        verify = maps:get(verify, Opts, false),
+        verify = normalize_verify(maps:get(verify, Opts, true)),
+        cacerts = maps:get(cacerts, Opts, undefined),
         client_cert = maps:get(cert, Opts, undefined),
         client_cert_chain = maps:get(cert_chain, Opts, []),
         client_private_key = maps:get(key, Opts, undefined),
@@ -4878,9 +4881,10 @@ process_tls_message(
     OriginalMsg,
     #state{role = client, tls_state = ?TLS_AWAITING_CERT} = State
 ) ->
-    %% Update transcript (we don't verify certs if verify = false)
     Transcript = <<(State#state.tls_transcript)/binary, OriginalMsg/binary>>,
-    %% Parse and store peer certificate
+    %% Parse and store peer certificate. The chain and identity are
+    %% validated at CertificateVerify, where the signature also proves
+    %% the server holds the leaf's private key.
     {PeerCert, PeerCertChain} =
         case quic_tls:parse_certificate(Body) of
             {ok, #{certificates := [First | Rest]}} ->
@@ -4890,12 +4894,21 @@ process_tls_message(
             {error, _} ->
                 {undefined, []}
         end,
-    State#state{
+    State1 = State#state{
         tls_state = ?TLS_AWAITING_CERT_VERIFY,
         tls_transcript = Transcript,
         peer_cert = PeerCert,
         peer_cert_chain = PeerCertChain
-    };
+    },
+    case State#state.verify andalso (PeerCert =:= undefined) of
+        true ->
+            %% verify enabled but server sent no certificate.
+            ?LOG_ERROR(#{what => server_sent_no_certificate}, ?QUIC_LOG_META),
+            notify_owner({error, {certificate_invalid, no_certificate}}, State1),
+            send_tls_alert(?TLS_ALERT_CERTIFICATE_REQUIRED, State1);
+        false ->
+            State1
+    end;
 %% Client receives server CertificateVerify
 process_tls_message(
     _Level,
@@ -4904,19 +4917,28 @@ process_tls_message(
     OriginalMsg,
     #state{role = client, tls_state = ?TLS_AWAITING_CERT_VERIFY} = State
 ) ->
-    %% Update transcript and record the server's CertificateVerify
-    %% scheme for the connected event.
-    Transcript = <<(State#state.tls_transcript)/binary, OriginalMsg/binary>>,
+    %% The signature is over the transcript up to and including
+    %% Certificate, i.e. before this message is appended.
+    {ClientHsKeys, _} = State#state.handshake_keys,
+    Cipher = ClientHsKeys#crypto_keys.cipher,
+    TranscriptHash = quic_crypto:transcript_hash(Cipher, State#state.tls_transcript),
     Scheme =
         case quic_tls:parse_certificate_verify(Body) of
             {ok, #{algorithm := Alg}} -> code_to_sig_alg(Alg);
             _ -> undefined
         end,
-    State#state{
+    Transcript = <<(State#state.tls_transcript)/binary, OriginalMsg/binary>>,
+    Advance = State#state{
         tls_state = ?TLS_AWAITING_FINISHED,
         tls_transcript = Transcript,
         negotiated_scheme = Scheme
-    };
+    },
+    case State#state.verify of
+        false ->
+            Advance;
+        true ->
+            verify_server_authentication(Body, TranscriptHash, Advance, State)
+    end;
 %% Client receives server's Finished
 process_tls_message(
     _Level,
@@ -8090,7 +8112,57 @@ default_alert_phrase(?TLS_ALERT_ILLEGAL_PARAMETER) -> <<"illegal parameter">>;
 default_alert_phrase(?TLS_ALERT_UNEXPECTED_MESSAGE) -> <<"unexpected message">>;
 default_alert_phrase(?TLS_ALERT_DECRYPT_ERROR) -> <<"decrypt error">>;
 default_alert_phrase(?TLS_ALERT_UNKNOWN_PSK_IDENTITY) -> <<"unknown psk identity">>;
+default_alert_phrase(?TLS_ALERT_BAD_CERTIFICATE) -> <<"bad certificate">>;
+default_alert_phrase(?TLS_ALERT_UNKNOWN_CA) -> <<"unknown ca">>;
+default_alert_phrase(?TLS_ALERT_CERTIFICATE_REQUIRED) -> <<"certificate required">>;
 default_alert_phrase(_) -> <<"tls alert">>.
+
+%% Normalise the `verify' option to a strict boolean. Accepts the
+%% historical booleans as well as ssl-style `verify_peer'/`verify_none'
+%% atoms passed through by quic_h3. Unknown values default to verifying.
+normalize_verify(true) -> true;
+normalize_verify(false) -> false;
+normalize_verify(verify_peer) -> true;
+normalize_verify(verify_none) -> false;
+normalize_verify(_) -> true.
+
+%% Verify the server's authentication: the CertificateVerify signature
+%% (proof of leaf private-key possession), then the certificate chain
+%% and the hostname. `Advance' is the post-message state to return when
+%% authentication succeeds; on failure we close from `State' so the
+%% catch-all ignores the trailing Finished.
+verify_server_authentication(Body, TranscriptHash, Advance, State) ->
+    PeerCert = State#state.peer_cert,
+    case quic_tls:verify_certificate_verify(Body, PeerCert, TranscriptHash, server) of
+        true ->
+            case
+                quic_cert:validate_server(
+                    PeerCert,
+                    State#state.peer_cert_chain,
+                    State#state.cacerts,
+                    State#state.server_name
+                )
+            of
+                ok ->
+                    Advance;
+                {error, Reason} ->
+                    ?LOG_ERROR(
+                        #{what => server_cert_invalid, reason => Reason}, ?QUIC_LOG_META
+                    ),
+                    notify_owner({error, {certificate_invalid, Reason}}, State),
+                    send_tls_alert(cert_alert_code(Reason), State)
+            end;
+        false ->
+            ?LOG_ERROR(#{what => server_cert_verify_failed}, ?QUIC_LOG_META),
+            notify_owner({error, {certificate_invalid, bad_signature}}, State),
+            send_tls_alert(?TLS_ALERT_DECRYPT_ERROR, State)
+    end.
+
+cert_alert_code(unknown_ca) -> ?TLS_ALERT_UNKNOWN_CA;
+cert_alert_code(no_trust_anchors) -> ?TLS_ALERT_UNKNOWN_CA;
+cert_alert_code(no_certificate) -> ?TLS_ALERT_CERTIFICATE_REQUIRED;
+cert_alert_code({hostname_mismatch, _}) -> ?TLS_ALERT_BAD_CERTIFICATE;
+cert_alert_code(_) -> ?TLS_ALERT_BAD_CERTIFICATE.
 
 %% Check timeouts
 check_timeouts(State) ->
