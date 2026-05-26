@@ -4182,7 +4182,20 @@ decode_and_process_streaming(Level, Data, State, Acc) ->
             ),
             {ok, NewState, lists:reverse(Acc)};
         {error, Reason} ->
-            {error, {frame_decode_error, Reason}};
+            %% RFC 9000 §12.4: a malformed/truncated frame from an
+            %% (authenticated) peer is a FRAME_ENCODING_ERROR, not a drop.
+            ?LOG_WARNING(
+                #{what => frame_decode_error, reason => Reason, level => Level}, ?QUIC_LOG_META
+            ),
+            NewState = close_with_error(
+                level_for_close(Level),
+                transport,
+                ?QUIC_FRAME_ENCODING_ERROR,
+                0,
+                <<"frame encoding error">>,
+                State
+            ),
+            {ok, NewState, lists:reverse(Acc)};
         {Frame, Rest} ->
             NewState = process_frame_track_probing(Level, Frame, State),
             decode_and_process_streaming(Level, Rest, NewState, [Frame | Acc])
@@ -4484,13 +4497,7 @@ process_frame(app, {path_response, ResponseData}, State) ->
     handle_path_response(ResponseData, State);
 %% NEW_CONNECTION_ID: Peer is providing a new CID for us to use
 process_frame(app, {new_connection_id, SeqNum, RetirePrior, CID, ResetToken}, State) ->
-    case handle_new_connection_id(SeqNum, RetirePrior, CID, ResetToken, State) of
-        {error, {connection_id_limit_error, _, _}} ->
-            %% RFC 9000: Exceeding active_connection_id_limit is a protocol error
-            State#state{close_reason = {protocol_violation, connection_id_limit_exceeded}};
-        NewState ->
-            NewState
-    end;
+    handle_new_connection_id(SeqNum, RetirePrior, CID, ResetToken, State);
 %% RETIRE_CONNECTION_ID: Peer is retiring one of our CIDs
 process_frame(app, {retire_connection_id, SeqNum}, State) ->
     handle_retire_connection_id(SeqNum, State);
@@ -4543,19 +4550,24 @@ process_frame(
             Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
             State#state{streams = NewStreams};
         error ->
-            %% Unknown stream - notify owner and create minimal state to track reset
-            Owner ! {quic, self(), {stream_opened, StreamId}},
-            NewStreams = maps:put(
-                StreamId,
-                #stream_state{
-                    id = StreamId,
-                    state = reset,
-                    final_size = FinalSize
-                },
-                Streams
-            ),
-            Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
-            State#state{streams = NewStreams}
+            case exceeds_stream_limit(StreamId, State) of
+                true ->
+                    stream_limit_close(State);
+                false ->
+                    %% Unknown stream - notify owner and create minimal state to track reset
+                    Owner ! {quic, self(), {stream_opened, StreamId}},
+                    NewStreams = maps:put(
+                        StreamId,
+                        #stream_state{
+                            id = StreamId,
+                            state = reset,
+                            final_size = FinalSize
+                        },
+                        Streams
+                    ),
+                    Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
+                    State#state{streams = NewStreams}
+            end
     end;
 %% RESET_STREAM_AT: Peer is aborting a stream with reliable delivery guarantee
 %% draft-ietf-quic-reliable-stream-reset-07
@@ -4610,21 +4622,26 @@ process_frame(
                     Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
                     State#state{streams = NewStreams};
                 error ->
-                    %% Unknown stream - notify owner and create minimal state
-                    Owner ! {quic, self(), {stream_opened, StreamId}},
-                    NewStreams = maps:put(
-                        StreamId,
-                        #stream_state{
-                            id = StreamId,
-                            state = reset,
-                            final_size = FinalSize,
-                            reset_reliable_size = ReliableSize,
-                            reset_error = ErrorCode
-                        },
-                        Streams
-                    ),
-                    Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
-                    State#state{streams = NewStreams}
+                    case exceeds_stream_limit(StreamId, State) of
+                        true ->
+                            stream_limit_close(State);
+                        false ->
+                            %% Unknown stream - notify owner and create minimal state
+                            Owner ! {quic, self(), {stream_opened, StreamId}},
+                            NewStreams = maps:put(
+                                StreamId,
+                                #stream_state{
+                                    id = StreamId,
+                                    state = reset,
+                                    final_size = FinalSize,
+                                    reset_reliable_size = ReliableSize,
+                                    reset_error = ErrorCode
+                                },
+                                Streams
+                            ),
+                            Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
+                            State#state{streams = NewStreams}
+                    end
             end
     end;
 %% STOP_SENDING: Peer wants us to stop sending on a stream
@@ -4634,44 +4651,49 @@ process_frame(
     {stop_sending, StreamId, ErrorCode},
     #state{owner = Owner, streams = Streams} = State
 ) ->
-    %% Clear any queued data for this stream and mark as stopped
-    NewStreams =
-        case maps:find(StreamId, Streams) of
-            {ok, Stream} ->
-                maps:put(
-                    StreamId,
-                    Stream#stream_state{
-                        state = stopped,
-                        % Clear queued data
-                        send_buffer = []
-                    },
-                    Streams
-                );
-            error ->
-                %% Unknown stream - notify owner and create minimal state
-                Owner ! {quic, self(), {stream_opened, StreamId}},
-                maps:put(
-                    StreamId,
-                    #stream_state{
-                        id = StreamId,
-                        state = stopped
-                    },
-                    Streams
-                )
-        end,
-    %% Notify owner - they should stop sending and may send RESET_STREAM
-    Owner ! {quic, self(), {stop_sending, StreamId, ErrorCode}},
-    %% Also remove from send queue and adjust byte / entry count
-    {NewSendQueue, RemovedBytes, RemovedCount} =
-        remove_stream_from_queue(StreamId, State#state.send_queue),
-    NewQueueBytes = max(0, State#state.send_queue_bytes - RemovedBytes),
-    NewQueueCount = max(0, State#state.send_queue_count - RemovedCount),
-    State#state{
-        streams = NewStreams,
-        send_queue = NewSendQueue,
-        send_queue_bytes = NewQueueBytes,
-        send_queue_count = NewQueueCount
-    };
+    case (not maps:is_key(StreamId, Streams)) andalso exceeds_stream_limit(StreamId, State) of
+        true ->
+            stream_limit_close(State);
+        false ->
+            %% Clear any queued data for this stream and mark as stopped
+            NewStreams =
+                case maps:find(StreamId, Streams) of
+                    {ok, Stream} ->
+                        maps:put(
+                            StreamId,
+                            Stream#stream_state{
+                                state = stopped,
+                                % Clear queued data
+                                send_buffer = []
+                            },
+                            Streams
+                        );
+                    error ->
+                        %% Unknown stream - notify owner and create minimal state
+                        Owner ! {quic, self(), {stream_opened, StreamId}},
+                        maps:put(
+                            StreamId,
+                            #stream_state{
+                                id = StreamId,
+                                state = stopped
+                            },
+                            Streams
+                        )
+                end,
+            %% Notify owner - they should stop sending and may send RESET_STREAM
+            Owner ! {quic, self(), {stop_sending, StreamId, ErrorCode}},
+            %% Also remove from send queue and adjust byte / entry count
+            {NewSendQueue, RemovedBytes, RemovedCount} =
+                remove_stream_from_queue(StreamId, State#state.send_queue),
+            NewQueueBytes = max(0, State#state.send_queue_bytes - RemovedBytes),
+            NewQueueCount = max(0, State#state.send_queue_count - RemovedCount),
+            State#state{
+                streams = NewStreams,
+                send_queue = NewSendQueue,
+                send_queue_bytes = NewQueueBytes,
+                send_queue_count = NewQueueCount
+            }
+    end;
 %% STREAM_DATA_BLOCKED: Peer is blocked by stream-level flow control
 %% RFC 9000 Section 19.13: Receipt opens the stream (Section 3.2)
 process_frame(
@@ -4684,18 +4706,23 @@ process_frame(
             %% Stream already exists, nothing to do (informational frame)
             State;
         false ->
-            %% New stream from peer - notify owner
-            Owner ! {quic, self(), {stream_opened, StreamId}},
-            %% Create minimal stream state
-            InitSendMaxData = get_peer_stream_limit(bidi_peer_initiated, State),
-            InitRecvMaxData = get_local_recv_limit(bidi_peer_initiated, State),
-            NewStream = #stream_state{
-                id = StreamId,
-                state = open,
-                send_max_data = InitSendMaxData,
-                recv_max_data = InitRecvMaxData
-            },
-            State#state{streams = maps:put(StreamId, NewStream, Streams)}
+            case exceeds_stream_limit(StreamId, State) of
+                true ->
+                    stream_limit_close(State);
+                false ->
+                    %% New stream from peer - notify owner
+                    Owner ! {quic, self(), {stream_opened, StreamId}},
+                    %% Create minimal stream state
+                    InitSendMaxData = get_peer_stream_limit(bidi_peer_initiated, State),
+                    InitRecvMaxData = get_local_recv_limit(bidi_peer_initiated, State),
+                    NewStream = #stream_state{
+                        id = StreamId,
+                        state = open,
+                        send_max_data = InitSendMaxData,
+                        recv_max_data = InitRecvMaxData
+                    },
+                    State#state{streams = maps:put(StreamId, NewStream, Streams)}
+            end
     end;
 %% DATA_BLOCKED: Peer is blocked by connection-level flow control (informational)
 %% RFC 9000 Section 19.12: DATA_BLOCKED is only allowed in 1-RTT packets
@@ -5794,7 +5821,10 @@ process_stream_data(StreamId, Offset, Data, Fin, State) ->
             % Silently ignore (could send STREAM_STATE_ERROR)
             State;
         ok ->
-            process_stream_data_validated(StreamId, Offset, Data, Fin, State)
+            case exceeds_stream_limit(StreamId, State) of
+                true -> stream_limit_close(State);
+                false -> process_stream_data_validated(StreamId, Offset, Data, Fin, State)
+            end
     end.
 
 %% Validate that we can receive on this stream
@@ -7019,6 +7049,29 @@ is_locally_initiated(StreamId, #state{role = Role}) ->
 %% @doc Check if stream is unidirectional.
 is_unidirectional(StreamId) ->
     (StreamId band 2) =/= 0.
+
+%% @doc RFC 9000 §4.6: a peer-initiated stream whose number is at or
+%% beyond the limit we advertised is a STREAM_LIMIT_ERROR. Our own
+%% streams are governed by the peer's MAX_STREAMS (checked on send), so
+%% they are never flagged here.
+exceeds_stream_limit(StreamId, State) ->
+    case is_locally_initiated(StreamId, State) of
+        true ->
+            false;
+        false ->
+            Limit =
+                case is_unidirectional(StreamId) of
+                    true -> State#state.max_streams_uni_local;
+                    false -> State#state.max_streams_bidi_local
+                end,
+            (StreamId bsr 2) >= Limit
+    end.
+
+stream_limit_close(State) ->
+    ?LOG_WARNING(#{what => stream_limit_exceeded}, ?QUIC_LOG_META),
+    close_with_transport_error(
+        ?QUIC_STREAM_LIMIT_ERROR, <<"stream limit exceeded">>, State
+    ).
 
 %% @doc Validate stream direction for sending.
 %% RFC 9000 Section 2.1: Cannot send on peer's unidirectional streams.
@@ -9673,48 +9726,68 @@ complete_migration(_, State) ->
 %% Adds the new CID to our pool of peer CIDs.
 %% RFC 9000 Section 5.1.1: Peer must not exceed our active_connection_id_limit.
 handle_new_connection_id(SeqNum, RetirePrior, CID, ResetToken, State) ->
+    #state{peer_cid_pool = Pool} = State,
+    case RetirePrior > SeqNum of
+        true ->
+            %% RFC 9000 §19.15: retire_prior_to MUST NOT exceed sequence_number.
+            close_with_transport_error(
+                ?QUIC_FRAME_ENCODING_ERROR,
+                <<"NEW_CONNECTION_ID retire_prior_to > sequence_number">>,
+                State
+            );
+        false ->
+            case lists:keyfind(SeqNum, #cid_entry.seq_num, Pool) of
+                #cid_entry{cid = CID, stateless_reset_token = ResetToken} ->
+                    %% Exact duplicate - ignore.
+                    State;
+                #cid_entry{} ->
+                    %% RFC 9000 §19.15: same sequence number, different CID or
+                    %% reset token.
+                    close_with_transport_error(
+                        ?QUIC_PROTOCOL_VIOLATION,
+                        <<"NEW_CONNECTION_ID sequence reuse with different CID">>,
+                        State
+                    );
+                false ->
+                    add_peer_connection_id(SeqNum, RetirePrior, CID, ResetToken, State)
+            end
+    end.
+
+add_peer_connection_id(SeqNum, RetirePrior, CID, ResetToken, State) ->
     #state{peer_cid_pool = Pool, local_active_cid_limit = Limit} = State,
-
-    %% Retire CIDs with seq < RetirePrior
-    RetiredPool = lists:map(
-        fun
-            (#cid_entry{seq_num = S} = Entry) when S < RetirePrior ->
-                Entry#cid_entry{status = retired};
-            (Entry) ->
-                Entry
-        end,
-        Pool
-    ),
-
-    %% Add new CID entry
+    %% Mark CIDs below RetirePrior for retirement.
+    RetiredPool = [retire_if_below(RetirePrior, E) || E <- Pool],
     NewEntry = #cid_entry{
         seq_num = SeqNum,
         cid = CID,
         stateless_reset_token = ResetToken,
         status = active
     },
-
-    %% Check if already exists
-    case lists:keyfind(SeqNum, #cid_entry.seq_num, RetiredPool) of
+    NewPool = [NewEntry | RetiredPool],
+    ActiveCount = length([E || #cid_entry{status = active} = E <- NewPool]),
+    case ActiveCount > Limit of
+        true ->
+            close_with_transport_error(
+                ?QUIC_CONNECTION_ID_LIMIT_ERROR,
+                <<"active_connection_id_limit exceeded">>,
+                State
+            );
         false ->
-            %% Add new entry
-            NewPool = [NewEntry | RetiredPool],
-            %% Count active CIDs after retirement
-            ActiveCount = length([E || #cid_entry{status = active} = E <- NewPool]),
-            %% RFC 9000: Peer must not exceed our limit
-            case ActiveCount > Limit of
-                true ->
-                    %% Protocol violation - close connection
-                    {error, {connection_id_limit_error, ActiveCount, Limit}};
-                false ->
-                    %% Send RETIRE_CONNECTION_ID for CIDs with seq < RetirePrior
-                    State1 = retire_peer_cids(RetirePrior, State#state{peer_cid_pool = NewPool}),
-                    State1
-            end;
-        _ ->
-            %% Duplicate, ignore
-            State#state{peer_cid_pool = RetiredPool}
+            %% Send RETIRE_CONNECTION_ID for the now-retired CIDs, then drop
+            %% them from the pool so it cannot grow without bound.
+            State1 = retire_peer_cids(RetirePrior, State#state{peer_cid_pool = NewPool}),
+            prune_retired_peer_cids(State1)
     end.
+
+retire_if_below(RetirePrior, #cid_entry{seq_num = S} = Entry) when S < RetirePrior ->
+    Entry#cid_entry{status = retired};
+retire_if_below(_RetirePrior, Entry) ->
+    Entry.
+
+%% Drop retired peer CIDs: RETIRE_CONNECTION_ID has been sent for them and
+%% we will not use them, so they need not be retained (RFC 9000 §5.1.2).
+prune_retired_peer_cids(#state{peer_cid_pool = Pool} = State) ->
+    State#state{peer_cid_pool = [E || #cid_entry{status = St} = E <- Pool, St =/= retired]}.
 
 %% Send RETIRE_CONNECTION_ID frames for CIDs that need to be retired
 %% RFC 9000 Section 19.16: Retires CIDs with sequence numbers less than RetirePrior
@@ -9788,6 +9861,10 @@ issue_cids(N, #state{local_cid_pool = Pool} = State) when N > 0 ->
         status = active
     },
 
+    %% Make the CID routable before advertising it, so the peer can use
+    %% it as a Destination CID as soon as it receives the frame.
+    maybe_register_cid(NewCID, State),
+
     %% Send NEW_CONNECTION_ID frame
     Frame = {new_connection_id, NextSeqNum, 0, NewCID, ResetToken},
     State1 = send_frame(Frame, State),
@@ -9795,6 +9872,19 @@ issue_cids(N, #state{local_cid_pool = Pool} = State) when N > 0 ->
     %% Add to pool and continue
     NewPool = [NewEntry | Pool],
     issue_cids(N - 1, State1#state{local_cid_pool = NewPool}).
+
+%% Server connections route through the listener's shared socket, so a
+%% newly issued CID must be added to the listener's routing table. Client
+%% connections own their socket and route locally, so this is a no-op.
+maybe_register_cid(CID, #state{role = server, listener = Listener}) when is_pid(Listener) ->
+    quic_listener:register_cid(Listener, CID, self());
+maybe_register_cid(_CID, _State) ->
+    ok.
+
+maybe_retire_cid(CID, #state{role = server, listener = Listener}) when is_pid(Listener) ->
+    quic_listener:retire_cid(Listener, CID);
+maybe_retire_cid(_CID, _State) ->
+    ok.
 
 %% @doc Generate a stateless reset token for a connection ID.
 %% RFC 9000 §10.3.2 requires the token to be hard for an external
@@ -10098,18 +10188,34 @@ apply_peer_transport_params_internal(TransportParams, State) ->
 
 %% @doc Handle RETIRE_CONNECTION_ID frame from peer.
 %% Marks the specified CID in our local pool as retired.
-handle_retire_connection_id(SeqNum, State) ->
-    #state{local_cid_pool = Pool} = State,
-    NewPool = lists:map(
-        fun
-            (#cid_entry{seq_num = S} = Entry) when S =:= SeqNum ->
-                Entry#cid_entry{status = retired};
-            (Entry) ->
-                Entry
-        end,
-        Pool
-    ),
-    State#state{local_cid_pool = NewPool}.
+handle_retire_connection_id(SeqNum, #state{local_cid_pool = Pool, local_cid_seq = NextSeq} = State) ->
+    case SeqNum >= NextSeq of
+        true ->
+            %% RFC 9000 §19.16: retiring a sequence number we never issued.
+            close_with_transport_error(
+                ?QUIC_PROTOCOL_VIOLATION,
+                <<"RETIRE_CONNECTION_ID for unissued sequence number">>,
+                State
+            );
+        false ->
+            %% Drop the retired CID from the listener routing table so it
+            %% no longer maps to this connection.
+            case lists:keyfind(SeqNum, #cid_entry.seq_num, Pool) of
+                #cid_entry{cid = RetiredCID} -> maybe_retire_cid(RetiredCID, State);
+                false -> ok
+            end,
+            NewPool = lists:map(
+                fun
+                    (#cid_entry{seq_num = S} = Entry) when S =:= SeqNum ->
+                        Entry#cid_entry{status = retired};
+                    (Entry) ->
+                        Entry
+                end,
+                Pool
+            ),
+            %% Replenish the peer's usable CID supply after a retirement.
+            issue_new_connection_ids(State#state{local_cid_pool = NewPool})
+    end.
 
 %%====================================================================
 %% PMTU Discovery (RFC 8899)
@@ -10378,7 +10484,12 @@ test_state_with_secret(Secret) ->
 %% Minimal #state{} scoped to role for frame-dispatch tests.
 -spec test_state_for_role(client | server) -> #state{}.
 test_state_for_role(Role) ->
-    #state{role = Role, app_keys = undefined}.
+    #state{
+        role = Role,
+        app_keys = undefined,
+        max_streams_bidi_local = ?DEFAULT_MAX_STREAMS_BIDI,
+        max_streams_uni_local = ?DEFAULT_MAX_STREAMS_UNI
+    }.
 
 -spec test_state_for_client({inet:ip_address(), inet:port_number()}) -> #state{}.
 test_state_for_client(RemoteAddr) ->

@@ -305,9 +305,14 @@ decode(<<?FRAME_STREAMS_BLOCKED_UNI, Rest/binary>>) ->
 decode(<<?FRAME_NEW_CONNECTION_ID, Rest/binary>>) ->
     {SeqNum, Rest1} = quic_varint:decode(Rest),
     {RetirePrior, Rest2} = quic_varint:decode(Rest1),
-    <<CIDLen, Rest3/binary>> = Rest2,
-    <<CID:CIDLen/binary, StatelessResetToken:16/binary, Rest4/binary>> = Rest3,
-    {{new_connection_id, SeqNum, RetirePrior, CID, StatelessResetToken}, Rest4};
+    case Rest2 of
+        %% RFC 9000 §19.15: connection ID length is 1..20 octets.
+        <<CIDLen, Rest3/binary>> when CIDLen >= 1, CIDLen =< 20, byte_size(Rest3) >= CIDLen + 16 ->
+            <<CID:CIDLen/binary, StatelessResetToken:16/binary, Rest4/binary>> = Rest3,
+            {{new_connection_id, SeqNum, RetirePrior, CID, StatelessResetToken}, Rest4};
+        _ ->
+            {error, frame_encoding_error}
+    end;
 decode(<<?FRAME_RETIRE_CONNECTION_ID, Rest/binary>>) ->
     {SeqNum, Rest1} = quic_varint:decode(Rest),
     {{retire_connection_id, SeqNum}, Rest1};
