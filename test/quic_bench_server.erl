@@ -105,6 +105,12 @@ init([Port, Mode]) ->
                 cert => CertDer,
                 key => KeyTerm,
                 alpn => [<<"bench">>, <<"h3">>],
+                %% Generous receive windows so clients can push multi-MB
+                %% streams without stalling on the small protocol defaults.
+                max_data => 256 * 1024 * 1024,
+                max_stream_data_bidi_local => 16 * 1024 * 1024,
+                max_stream_data_bidi_remote => 16 * 1024 * 1024,
+                max_stream_data_uni => 16 * 1024 * 1024,
                 connection_handler => fun(ConnPid, ConnRef) ->
                     spawn_handler(Self, ConnPid, ConnRef, Mode)
                 end
@@ -176,27 +182,26 @@ spawn_handler(StatsServer, ConnPid, ConnRef, Mode) ->
     HandlerPid = spawn_link(fun() ->
         connection_handler(StatsServer, ConnPid, ConnRef, Mode)
     end),
+    %% Transfer ownership so the handler receives the {quic, ConnRef, _} events.
+    ok = quic:set_owner_sync(ConnPid, HandlerPid),
     {ok, HandlerPid}.
 
 connection_handler(StatsServer, ConnPid, ConnRef, Mode) ->
-    %% Wait for connection to be established
-    receive
-        {quic, ConnRef, {connected, _Info}} ->
-            connection_loop(
-                StatsServer,
-                ConnPid,
-                ConnRef,
-                Mode,
-                #{bytes_recv => 0, bytes_sent => 0, streams => 0}
-            )
-    after 5000 ->
-        io:format("Connection timeout~n"),
-        ok
-    end.
+    %% The connection is already established when the handler is spawned, and
+    %% {connected} may have been delivered before ownership was transferred.
+    %% Enter the loop directly; a late {connected} is absorbed by the catch-all.
+    connection_loop(
+        StatsServer,
+        ConnPid,
+        ConnRef,
+        Mode,
+        #{bytes_recv => 0, bytes_sent => 0, streams => 0}
+    ).
 
 connection_loop(StatsServer, ConnPid, ConnRef, Mode, Acc) ->
+    %% Server-side connection events are tagged with the connection pid.
     receive
-        {quic, ConnRef, {stream_data, StreamId, Data, Fin}} ->
+        {quic, ConnPid, {stream_data, StreamId, Data, Fin}} ->
             BytesRecv = byte_size(Data),
             NewAcc0 = Acc#{bytes_recv => maps:get(bytes_recv, Acc, 0) + BytesRecv},
 
@@ -204,15 +209,11 @@ connection_loop(StatsServer, ConnPid, ConnRef, Mode, Acc) ->
             NewAcc =
                 case Mode of
                     echo ->
-                        %% Echo the data back
-                        case quic_connection:send_data(ConnPid, StreamId, Data, Fin) of
-                            ok ->
-                                NewAcc0#{
-                                    bytes_sent => maps:get(bytes_sent, NewAcc0, 0) + BytesRecv
-                                };
-                            _ ->
-                                NewAcc0
-                        end;
+                        %% Echo back asynchronously so the loop keeps draining
+                        %% stream_data events instead of blocking on congestion
+                        %% control for each send.
+                        _ = quic:send_data_async(ConnPid, StreamId, Data, Fin),
+                        NewAcc0#{bytes_sent => maps:get(bytes_sent, NewAcc0, 0) + BytesRecv};
                     sink ->
                         %% Just discard
                         NewAcc0;
@@ -222,10 +223,10 @@ connection_loop(StatsServer, ConnPid, ConnRef, Mode, Acc) ->
                 end,
 
             connection_loop(StatsServer, ConnPid, ConnRef, Mode, NewAcc);
-        {quic, ConnRef, {stream_opened, _StreamId}} ->
+        {quic, ConnPid, {stream_opened, _StreamId}} ->
             NewAcc = Acc#{streams => maps:get(streams, Acc, 0) + 1},
             connection_loop(StatsServer, ConnPid, ConnRef, Mode, NewAcc);
-        {quic, ConnRef, {closed, _Reason}} ->
+        {quic, ConnPid, {closed, _Reason}} ->
             %% Connection closed, report stats
             StatsServer !
                 {stats_update, maps:get(bytes_recv, Acc, 0), maps:get(bytes_sent, Acc, 0),

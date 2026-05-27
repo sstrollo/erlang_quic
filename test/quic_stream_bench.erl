@@ -422,16 +422,27 @@ concurrent_streams(Host, Port, Opts) ->
 %% Connect with timeout handling
 connect_with_timeout(Host, Port, Timeout) ->
     %% Client options: ALPN must match server
-    Opts = #{alpn => [<<"bench">>, <<"h3">>], verify => false},
+    Opts = #{
+        alpn => [<<"bench">>, <<"h3">>],
+        verify => false,
+        %% Generous flow-control windows so multi-MB streams aren't blocked by
+        %% the small protocol defaults (echo direction, server -> client).
+        max_data => 256 * 1024 * 1024,
+        max_stream_data_bidi_local => 16 * 1024 * 1024,
+        max_stream_data_bidi_remote => 16 * 1024 * 1024,
+        max_stream_data_uni => 16 * 1024 * 1024
+    },
 
-    case quic_connection:connect(Host, Port, Opts, self()) of
-        {ok, ConnRef, ConnPid} ->
-            %% Wait for connection to be established
+    %% quic:connect/4 wires up the datagram receive path; the returned pid is
+    %% both the connection ref carried in {quic, Conn, _} messages and the pid
+    %% the quic_connection API calls take.
+    case quic:connect(Host, Port, Opts, self()) of
+        {ok, Conn} ->
             receive
-                {quic, ConnRef, {connected, _Info}} ->
-                    {ok, ConnRef, ConnPid}
+                {quic, Conn, {connected, _Info}} ->
+                    {ok, Conn, Conn}
             after Timeout ->
-                quic_connection:close(ConnPid, timeout),
+                quic_connection:close(Conn, timeout),
                 {error, connect_timeout}
             end;
         {error, Reason} ->
