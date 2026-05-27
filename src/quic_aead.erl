@@ -34,7 +34,9 @@
     decrypt/5,
     decrypt/6,
     protect_header/4,
+    protect_header/5,
     unprotect_header/4,
+    unprotect_header/5,
     compute_nonce/2,
     compute_hp_mask/3,
     %% Consolidated packet protection API
@@ -135,7 +137,16 @@ decrypt(Key, IV, PN, AAD, CiphertextWithTag, Cipher) ->
 -spec protect_header(binary(), binary(), binary(), non_neg_integer()) ->
     binary() | {error, payload_too_short}.
 protect_header(HP, Header, EncryptedPayload, PNOffset) ->
-    Cipher = cipher_for_key(HP),
+    %% Infer the cipher from the key length. Ambiguous for 32-byte keys
+    %% (AES-256-GCM vs ChaCha20-Poly1305); callers that know the cipher
+    %% should use protect_header/5.
+    protect_header(cipher_for_key(HP), HP, Header, EncryptedPayload, PNOffset).
+
+%% @doc Apply header protection with an explicit cipher (avoids the
+%% 32-byte key ambiguity between AES-256-GCM and ChaCha20-Poly1305).
+-spec protect_header(cipher(), binary(), binary(), binary(), non_neg_integer()) ->
+    binary() | {error, payload_too_short}.
+protect_header(Cipher, HP, Header, EncryptedPayload, PNOffset) ->
     <<FirstByte, _/binary>> = Header,
     PNLen = (FirstByte band 16#03) + 1,
     %% Sample starts (4 - PNLen) bytes into ciphertext
@@ -165,12 +176,18 @@ protect_header(HP, Header, EncryptedPayload, PNOffset) ->
 %% Returns: {UnprotectedHeader, PNLength} or {error, payload_too_short}
 -spec unprotect_header(binary(), binary(), binary(), non_neg_integer()) ->
     {binary(), pos_integer()} | {error, payload_too_short}.
-unprotect_header(HP, ProtectedHeader, EncryptedPayload, _PNOffset) ->
+unprotect_header(HP, ProtectedHeader, EncryptedPayload, PNOffset) ->
+    %% See protect_header/4 re: the 32-byte key ambiguity.
+    unprotect_header(cipher_for_key(HP), HP, ProtectedHeader, EncryptedPayload, PNOffset).
+
+%% @doc Remove header protection with an explicit cipher.
+-spec unprotect_header(cipher(), binary(), binary(), binary(), non_neg_integer()) ->
+    {binary(), pos_integer()} | {error, payload_too_short}.
+unprotect_header(Cipher, HP, ProtectedHeader, EncryptedPayload, _PNOffset) ->
     case byte_size(EncryptedPayload) >= ?MIN_PAYLOAD_FOR_SAMPLE of
         false ->
             {error, payload_too_short};
         true ->
-            Cipher = cipher_for_key(HP),
             %% Sample is at position 4 from start of PN
             %% PN is at position 0 of EncryptedPayload
             Sample = binary:part(EncryptedPayload, ?HP_SAMPLE_OFFSET, ?HP_SAMPLE_LEN),
@@ -350,7 +367,7 @@ protect_packet_common(Cipher, Key, IV, HP, PN, HeaderPrefix, PNBin, Plaintext) -
     ),
     EncryptedPayload = <<Ciphertext/binary, Tag/binary>>,
     PNOffset = byte_size(HeaderPrefix),
-    ProtectedHeader = protect_header(HP, AAD, EncryptedPayload, PNOffset),
+    ProtectedHeader = protect_header(Cipher, HP, AAD, EncryptedPayload, PNOffset),
     <<ProtectedHeader/binary, EncryptedPayload/binary>>.
 
 %% @doc Unprotect and decrypt a short header (1-RTT) packet.
@@ -405,7 +422,7 @@ unprotect_long_packet(Cipher, Key, IV, HP, Header, EncryptedPayload, LargestRecv
 %% Removes header protection, reconstructs PN, and decrypts payload.
 unprotect_packet_common(Cipher, Key, IV, HP, Header, EncryptedPayload, LargestRecv) ->
     PNOffset = byte_size(Header),
-    case unprotect_header(HP, Header, EncryptedPayload, PNOffset) of
+    case unprotect_header(Cipher, HP, Header, EncryptedPayload, PNOffset) of
         {error, Reason} ->
             {error, {header_unprotect_failed, Reason}};
         {UnprotectedHeader, PNLen} ->

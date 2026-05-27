@@ -112,13 +112,9 @@ get_port(Name) ->
 %% Used when a server was started with port 0 and we've discovered the actual port.
 -spec update_port(atom(), inet:port_number()) -> ok | {error, not_found}.
 update_port(Name, Port) when is_atom(Name), is_integer(Port), Port > 0, Port =< 65535 ->
-    case ets:lookup(?TABLE, Name) of
-        [{Name, Info}] ->
-            true = ets:insert(?TABLE, {Name, Info#{port => Port}}),
-            ok;
-        [] ->
-            {error, not_found}
-    end.
+    %% Route through the owner so the registry table can stay `protected'
+    %% (only the registry process writes it).
+    gen_server:call(?MODULE, {update_port, Name, Port}).
 
 %% @doc Get the connection PIDs for a named server.
 -spec get_connections(atom()) -> {ok, [pid()]} | {error, not_found}.
@@ -152,7 +148,9 @@ init([]) ->
     ?TABLE = ets:new(?TABLE, [
         named_table,
         set,
-        public,
+        %% Reads happen from any process (lookup/get_connections); only the
+        %% registry process writes, so `protected' rather than `public'.
+        protected,
         {read_concurrency, true}
     ]),
     {ok, #state{}}.
@@ -188,8 +186,19 @@ handle_call({unregister, Name}, _From, State = #state{monitors = Monitors}) ->
         [] ->
             {reply, ok, State}
     end;
+handle_call({update_port, Name, Port}, _From, State) ->
+    {reply, do_update_port(Name, Port), State};
 handle_call(_Request, _From, State) ->
     {reply, {error, not_implemented}, State}.
+
+do_update_port(Name, Port) ->
+    case ets:lookup(?TABLE, Name) of
+        [{Name, Info}] ->
+            true = ets:insert(?TABLE, {Name, Info#{port => Port}}),
+            ok;
+        [] ->
+            {error, not_found}
+    end.
 
 handle_cast(_Msg, State) ->
     {noreply, State}.

@@ -9564,6 +9564,13 @@ handle_path_validation_timeout(#state{pending_peer_validation = PathState} = Sta
 %% RFC 9000 Section 9.6: Auto-migrate to preferred address on validation success.
 %% RFC 9000 Section 9.3.2: Check both new and old path for anti-spoofing defense.
 handle_path_response(ResponseData, State) ->
+    %% Validation matches on the 64-bit challenge data carried in an
+    %% AEAD-protected packet, so off-path forgery is infeasible. RFC 9000
+    %% §8.2.3 also expects the response on the path the challenge was sent;
+    %% we do not additionally bind it to the source address (an on-path
+    %% observer could otherwise answer from a different path). Noted as a
+    %% known limitation; a source-address check would interact with NAT
+    %% rebinding and is deferred.
     %% First check if this is a response to peer address validation (server validating client)
     case check_peer_validation_response(ResponseData, State) of
         {new_path_validated, PendingPath, State1} ->

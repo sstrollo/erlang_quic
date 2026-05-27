@@ -341,6 +341,14 @@ encode_block_cipher(FirstByte, ServerID, Nonce, Key) ->
 
 %% @private Encode for exactly 16-byte CID (15-byte payload)
 %% Use AES-CTR mode since AES-ECB requires exact 16-byte blocks
+%%
+%% KNOWN LIMITATION (RFC 9312 conformance, not a QUIC security property):
+%% the fixed IV makes the CTR keystream identical for every CID from this
+%% server, so the encrypted Server ID bytes (a fixed plaintext) are
+%% identical across CIDs — an observer can group CIDs by server, defeating
+%% the obfuscation. The <16 and >16 paths mix the per-CID nonce and do not
+%% have this issue. A conformant fix needs the nonce-mixed single-pass
+%% construction (with matching decode); deferred.
 encode_block_cipher_15(FirstByte, ServerID, Nonce, Key, CR) ->
     Payload = <<ServerID/binary, Nonce/binary>>,
     %% Use a fixed IV derived from the key (so decryption doesn't need the nonce)
