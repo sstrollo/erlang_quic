@@ -28,9 +28,11 @@ start_link() ->
     pid()
 ) -> {ok, pid()} | {error, term()}.
 start_child(Host, Port, Opts, Owner) ->
+    %% Supervised attempts are linked to this supervisor, not the caller, so
+    %% they monitor their owner to close when it dies (see quic_connection).
     Spec = #{
         id => {quic_connection, make_ref()},
-        start => {quic_connection, start_link, [Host, Port, Opts, Owner]},
+        start => {quic_connection, start_link, [Host, Port, Opts#{monitor_owner => true}, Owner]},
         restart => temporary,
         shutdown => 5000,
         type => worker,

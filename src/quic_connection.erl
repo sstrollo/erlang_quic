@@ -1317,9 +1317,17 @@ open_client_socket_backend({IP, _Port}, Opts) ->
 address_family(IP) when tuple_size(IP) =:= 4 -> inet;
 address_family(IP) when tuple_size(IP) =:= 8 -> inet6.
 
-%% Swap the owner, re-pointing the owner monitor when one exists. Client
-%% connections monitor their owner (set in init_client_state); server
-%% connections do not (owner_mon =:= undefined) and keep that behavior.
+%% Monitor the owner only for supervised connections, which aren't linked to
+%% their caller. undefined keeps caller-linked and server connections as-is.
+maybe_monitor_owner(Opts, Owner) ->
+    case maps:get(monitor_owner, Opts, false) of
+        true -> erlang:monitor(process, Owner);
+        false -> undefined
+    end.
+
+%% Swap the owner, re-pointing the owner monitor when one exists. Supervised
+%% connections monitor their owner (set in init_client_state); caller-linked
+%% and server connections do not (owner_mon =:= undefined) and keep that.
 reown(#state{owner_mon = undefined} = State, NewOwner) ->
     State#state{owner = NewOwner};
 reown(#state{owner_mon = OldMon} = State, NewOwner) ->
@@ -1428,7 +1436,10 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
         remote_addr = RemoteAddr,
         local_addr = LocalAddr,
         owner = Owner,
-        owner_mon = erlang:monitor(process, Owner),
+        %% Only supervised connections (started by quic_conn_sup) monitor their
+        %% owner; caller-linked connections rely on the link instead, so they do
+        %% not stop a different owner's death from propagating through the link.
+        owner_mon = maybe_monitor_owner(Opts, Owner),
         conn_ref = ConnRef,
         server_name = ServerName,
         verify = normalize_verify(maps:get(verify, Opts, true)),
