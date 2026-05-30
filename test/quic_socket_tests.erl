@@ -62,6 +62,46 @@ open_with_custom_batch_config_test() ->
     ?assertMatch({ok, {_, _}}, quic_socket:sockname(State)),
     ok = quic_socket:close(State).
 
+%% open/2 selects the OTP socket backend on Linux and gen_udp elsewhere, so
+%% these exercise whichever backend the platform uses.
+open_ipv4_default_test() ->
+    {ok, State} = quic_socket:open(0, #{}),
+    {ok, {Addr, _Port}} = quic_socket:sockname(State),
+    ?assertEqual(4, tuple_size(Addr)),
+    ok = quic_socket:close(State).
+
+open_ipv6_inet6_atom_test() ->
+    case ipv6_available() of
+        false ->
+            ok;
+        true ->
+            {ok, State} = quic_socket:open(0, #{extra_socket_opts => [inet6]}),
+            {ok, {Addr, _Port}} = quic_socket:sockname(State),
+            ?assertEqual(8, tuple_size(Addr)),
+            ok = quic_socket:close(State)
+    end.
+
+open_ipv6_bind_addr_test() ->
+    case ipv6_available() of
+        false ->
+            ok;
+        true ->
+            V6 = {0, 0, 0, 0, 0, 0, 0, 1},
+            {ok, State} = quic_socket:open(0, #{extra_socket_opts => [{ip, V6}]}),
+            {ok, {Addr, _Port}} = quic_socket:sockname(State),
+            ?assertEqual(V6, Addr),
+            ok = quic_socket:close(State)
+    end.
+
+ipv6_available() ->
+    case gen_udp:open(0, [binary, inet6, {ip, {0, 0, 0, 0, 0, 0, 0, 1}}]) of
+        {ok, S} ->
+            gen_udp:close(S),
+            true;
+        {error, _} ->
+            false
+    end.
+
 %%====================================================================
 %% Wrap Existing Socket Tests
 %%====================================================================

@@ -82,6 +82,35 @@ get_connections_empty_test() ->
     ?assertEqual([], Connections),
     ok = quic_listener:stop(Listener).
 
+%% Regression for #146: an IPv6 family in extra_socket_opts must start a
+%% listener instead of crashing init with the hard-coded inet family.
+listen_ipv6_inet6_atom_test() ->
+    listen_ipv6_with(#{extra_socket_opts => [inet6]}).
+
+listen_ipv6_bind_addr_test() ->
+    listen_ipv6_with(#{extra_socket_opts => [{ip, {0, 0, 0, 0, 0, 0, 0, 1}}]}).
+
+listen_ipv6_with(Extra) ->
+    case ipv6_available() of
+        false ->
+            ok;
+        true ->
+            {Cert, PrivKey} = generate_test_cert(),
+            Opts = maps:merge(#{cert => Cert, key => PrivKey, alpn => [<<"h3">>]}, Extra),
+            {ok, Listener} = quic_listener:start_link(0, Opts),
+            ?assert(is_process_alive(Listener)),
+            ok = quic_listener:stop(Listener)
+    end.
+
+ipv6_available() ->
+    case gen_udp:open(0, [binary, inet6, {ip, {0, 0, 0, 0, 0, 0, 0, 1}}]) of
+        {ok, S} ->
+            gen_udp:close(S),
+            true;
+        {error, _} ->
+            false
+    end.
+
 %%====================================================================
 %% Multiple Listener Tests
 %%====================================================================

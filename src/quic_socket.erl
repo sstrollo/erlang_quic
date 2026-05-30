@@ -135,7 +135,8 @@
 -spec open(inet:port_number(), map()) ->
     {ok, socket_state()} | {error, term()}.
 open(Port, Opts) ->
-    Capabilities = detect_capabilities(),
+    Family = extra_socket_family(maps:get(extra_socket_opts, Opts, [])),
+    Capabilities = detect_capabilities(Family),
     Backend = maps:get(backend, Capabilities, gen_udp),
     GSOSupported = maps:get(gso, Capabilities, false),
     GROSupported = maps:get(gro, Capabilities, false),
@@ -147,7 +148,7 @@ open(Port, Opts) ->
 
     case Backend of
         socket ->
-            open_socket_backend(Port, Opts, #{
+            open_socket_backend(Port, Family, Opts, #{
                 gso_supported => GSOSupported,
                 gro_supported => GROSupported,
                 batching_enabled => BatchingEnabled,
@@ -168,7 +169,8 @@ open(Port, Opts) ->
 -spec open_for_send(inet:ip_address(), map()) ->
     {ok, socket_state()} | {error, term()}.
 open_for_send(RemoteIP, Opts) ->
-    Capabilities = detect_capabilities(),
+    Family = family(RemoteIP),
+    Capabilities = detect_capabilities(Family),
     %% Allow the caller to force a backend (via `backend => socket'
     %% in Opts) so the opt-in client path can request the OTP socket
     %% NIF even on platforms where capability detection would pick
@@ -188,14 +190,14 @@ open_for_send(RemoteIP, Opts) ->
 
     case Backend of
         socket ->
-            open_send_socket_backend(RemoteIP, Opts, #{
+            open_send_socket_backend(Family, Opts, #{
                 gso_supported => GSOSupported,
                 batching_enabled => BatchingEnabled,
                 max_batch => MaxBatch,
                 gso_size => GSOSize
             });
         gen_udp ->
-            open_send_genudp_backend(RemoteIP, Opts, #{
+            open_send_genudp_backend(Family, Opts, #{
                 batching_enabled => BatchingEnabled,
                 max_batch => MaxBatch,
                 gso_size => GSOSize
@@ -208,7 +210,8 @@ open_for_send(RemoteIP, Opts) ->
 -spec open_server_send({inet:ip_address(), inet:port_number()}, map()) ->
     {ok, socket_state()} | {error, term()}.
 open_server_send({LocalIP, LocalPort}, Opts) ->
-    Capabilities = detect_capabilities(),
+    Family = family(LocalIP),
+    Capabilities = detect_capabilities(Family),
     Backend = maps:get(backend, Capabilities, gen_udp),
     GSOSupported = maps:get(gso, Capabilities, false),
 
@@ -226,14 +229,13 @@ open_server_send({LocalIP, LocalPort}, Opts) ->
 
     case Backend of
         socket ->
-            open_server_send_socket(LocalIP, LocalPort, Opts, BatchConfig);
+            open_server_send_socket(LocalIP, LocalPort, Family, Opts, BatchConfig);
         gen_udp ->
             open_server_send_genudp(LocalIP, LocalPort, Opts, BatchConfig)
     end.
 
 %% Open OTP socket for server send with reuseport binding
-open_server_send_socket(LocalIP, LocalPort, Opts, BatchConfig) ->
-    Family = family(LocalIP),
+open_server_send_socket(LocalIP, LocalPort, Family, Opts, BatchConfig) ->
     case socket:open(Family, dgram, udp) of
         {ok, Socket} ->
             configure_server_send_socket(Socket, LocalIP, LocalPort, Family, Opts, BatchConfig);
@@ -688,12 +690,18 @@ client_recv_loop(#socket_state{socket = Socket} = SocketState, Owner) ->
             ok
     end.
 
-%% @doc Detect platform capabilities for GSO/GRO.
+%% @doc Detect platform capabilities for GSO/GRO. Context-free wrapper that
+%% probes the IPv4 family; callers that know their target family should use
+%% detect_capabilities/1 so an IPv6-only host is not wrongly downgraded.
 -spec detect_capabilities() -> map().
 detect_capabilities() ->
+    detect_capabilities(inet).
+
+-spec detect_capabilities(inet | inet6) -> map().
+detect_capabilities(Family) ->
     case os:type() of
         {unix, linux} ->
-            detect_linux_capabilities();
+            detect_linux_capabilities(Family);
         _ ->
             #{gso => false, gro => false, backend => gen_udp}
     end.
@@ -702,19 +710,22 @@ detect_capabilities() ->
 %% Internal Functions - Socket Backend
 %%====================================================================
 
-open_socket_backend(Port, Opts, BatchConfig) ->
-    case socket:open(inet, dgram, udp) of
+open_socket_backend(Port, Family, Opts, BatchConfig) ->
+    case socket:open(Family, dgram, udp) of
         {ok, Socket} ->
-            configure_and_bind_socket(Socket, Port, Opts, BatchConfig);
+            configure_and_bind_socket(Socket, Port, Family, Opts, BatchConfig);
         {error, _} = Error ->
             Error
     end.
 
-configure_and_bind_socket(Socket, Port, Opts, BatchConfig) ->
+configure_and_bind_socket(Socket, Port, Family, Opts, BatchConfig) ->
     ok = socket:setopt(Socket, {socket, reuseaddr}, true),
     set_socket_buffer_sizes(Socket, Opts),
     maybe_set_reuseport(Socket, Opts),
-    bind_and_finalize_socket(Socket, Port, BatchConfig).
+    %% Honor a specific bind address from extra_socket_opts {ip, Addr};
+    %% fall back to the family wildcard.
+    BindAddr = proplists:get_value(ip, maps:get(extra_socket_opts, Opts, []), any),
+    bind_and_finalize_socket(Socket, Port, Family, BindAddr, BatchConfig).
 
 set_socket_buffer_sizes(Socket, Opts) ->
     RecBuf = maps:get(recbuf, Opts, ?DEFAULT_UDP_RECBUF),
@@ -729,8 +740,8 @@ maybe_set_reuseport(Socket, Opts) ->
         false -> ok
     end.
 
-bind_and_finalize_socket(Socket, Port, BatchConfig) ->
-    Addr = #{family => inet, addr => any, port => Port},
+bind_and_finalize_socket(Socket, Port, Family, BindAddr, BatchConfig) ->
+    Addr = #{family => Family, addr => BindAddr, port => Port},
     case socket:bind(Socket, Addr) of
         ok ->
             build_socket_state(Socket, BatchConfig);
@@ -784,8 +795,7 @@ maybe_enable_gro(_, _) ->
 %%====================================================================
 
 %% Open socket backend optimized for sending (no binding to specific port)
-open_send_socket_backend(RemoteIP, Opts, BatchConfig) ->
-    Family = family(RemoteIP),
+open_send_socket_backend(Family, Opts, BatchConfig) ->
     case socket:open(Family, dgram, udp) of
         {ok, Socket} ->
             configure_send_socket(Socket, Opts, BatchConfig);
@@ -816,8 +826,8 @@ configure_send_socket(Socket, Opts, BatchConfig) ->
     {ok, State}.
 
 %% Open gen_udp backend optimized for sending (ephemeral port)
-open_send_genudp_backend(_RemoteIP, Opts, BatchConfig) ->
-    SocketOpts = build_send_genudp_opts(Opts),
+open_send_genudp_backend(Family, Opts, BatchConfig) ->
+    SocketOpts = build_send_genudp_opts(Family, Opts),
     case gen_udp:open(0, SocketOpts) of
         {ok, Socket} ->
             {ok, build_genudp_state(Socket, BatchConfig)};
@@ -825,14 +835,14 @@ open_send_genudp_backend(_RemoteIP, Opts, BatchConfig) ->
             Error
     end.
 
-build_send_genudp_opts(Opts) ->
+build_send_genudp_opts(Family, Opts) ->
     ActiveN = maps:get(active_n, Opts, 100),
     ExtraFlags = maps:get(extra_socket_opts, Opts, []),
     RecBuf = maps:get(recbuf, Opts, ?DEFAULT_UDP_RECBUF),
     SndBuf = maps:get(sndbuf, Opts, ?DEFAULT_UDP_SNDBUF),
     [
         binary,
-        inet,
+        Family,
         {active, ActiveN},
         {reuseaddr, true},
         {recbuf, RecBuf},
@@ -860,7 +870,7 @@ build_genudp_opts(Opts) ->
     SndBuf = maps:get(sndbuf, Opts, ?DEFAULT_UDP_SNDBUF),
     BaseOpts = [
         binary,
-        inet,
+        extra_socket_family(ExtraFlags),
         {active, ActiveN},
         {reuseaddr, true},
         {recbuf, RecBuf},
@@ -1153,6 +1163,19 @@ record_flush(
 family({_, _, _, _}) -> inet;
 family({_, _, _, _, _, _, _, _}) -> inet6.
 
+%% Infer the UDP address family from caller socket options: inet6 when an
+%% `inet6' atom or an 8-tuple `{ip, _}' is present, inet otherwise.
+extra_socket_family(Extra) ->
+    case lists:member(inet6, Extra) of
+        true ->
+            inet6;
+        false ->
+            case proplists:get_value(ip, Extra) of
+                {_, _, _, _, _, _, _, _} -> inet6;
+                _ -> inet
+            end
+    end.
+
 %%====================================================================
 %% Internal Functions - GRO Receive
 %%====================================================================
@@ -1200,14 +1223,14 @@ split_gro_packets(Data, SegmentSize, Acc) ->
 %% Internal Functions - Linux Capability Detection
 %%====================================================================
 
-detect_linux_capabilities() ->
+detect_linux_capabilities(Family) ->
     %% Check OTP version - need 27+ for socket module features
     case otp_version_check() of
         false ->
             #{gso => false, gro => false, backend => gen_udp};
         true ->
             %% Try to create a test socket and check GSO/GRO
-            test_linux_socket_capabilities()
+            test_linux_socket_capabilities(Family)
     end.
 
 otp_version_check() ->
@@ -1220,8 +1243,8 @@ otp_version_check() ->
         _:_ -> false
     end.
 
-test_linux_socket_capabilities() ->
-    case socket:open(inet, dgram, udp) of
+test_linux_socket_capabilities(Family) ->
+    case socket:open(Family, dgram, udp) of
         {ok, Socket} ->
             %% Test GSO
             GSOSupported = test_gso(Socket),
