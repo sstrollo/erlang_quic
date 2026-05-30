@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- IPv6 client connections: `quic:connect/4` accepts a hostname, an IP-literal string (IPv4 or IPv6, optionally bracketed), or an `inet:ip_address()` tuple. Dual-stack hostnames use RFC 8305 Happy Eyeballs (IPv6-first racing) with `happy_eyeballs`, `family`, `connection_attempt_delay` and `connect_timeout` options. A hostname that fails to resolve returns `{error, Reason}` instead of dialing a default address. (#150)
+- Listeners can bind to IPv6: pass `inet6` or an IPv6 `{ip, Addr}` in `extra_socket_opts`; the address family is inferred from those options. (#149)
+
 ## [1.4.5] - 2026-05-28
 
 ### Fixed

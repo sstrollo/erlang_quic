@@ -88,6 +88,15 @@ transparently.
 | `socket` | gen_udp:socket() | - | Pre-opened UDP socket |
 | `extra_socket_opts` | list() | `[]` | Options for socket creation |
 
+### Address Resolution Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `happy_eyeballs` | boolean | true | Race IPv6/IPv4 for dual-stack hostnames (RFC 8305) |
+| `family` | `inet \| inet6 \| any` | `any` | Restrict resolution to one address family |
+| `connection_attempt_delay` | integer | 250 | Happy Eyeballs stagger between attempts (ms) |
+| `connect_timeout` | integer | 5000 | Overall Happy Eyeballs deadline (ms) |
+
 ### Advanced Options
 
 | Option | Type | Default | Description |
@@ -299,6 +308,35 @@ To prevent migration (e.g., for server-side load balancing):
 %% Note: When using socket option, the connection does not own the socket.
 %% You must close it yourself after the connection terminates.
 ```
+
+### IPv6 and Happy Eyeballs (RFC 8305)
+
+`Host` may be a hostname, an IP-literal string (IPv4 or IPv6, optionally
+bracketed), or an `inet:ip_address()` tuple.
+
+```erlang
+quic:connect("example.com", 443, #{}, self()).   % hostname (Happy Eyeballs)
+quic:connect("[2606:4700::1111]", 443, #{}, self()).  % IPv6 literal
+quic:connect({2606,17008,16#1000,0,0,0,0,1}, 443, #{}, self()).  % address tuple
+```
+
+When a hostname resolves to both IPv4 and IPv6 addresses, the addresses
+are raced IPv6-first and the first to complete its handshake is used. In
+that case `connect/4` blocks until the first attempt connects (or all
+fail / time out), then returns `{ok, Conn}`; the owner still receives the
+`{connected, Info}` message. A single resolved address, an IP
+literal/tuple, or a pre-opened `socket` keeps the immediate, asynchronous
+return.
+
+```erlang
+%% Force IPv6, or disable racing for the legacy IPv4-first resolver.
+quic:connect("example.com", 443, #{family => inet6}, self()).
+quic:connect("example.com", 443, #{happy_eyeballs => false}, self()).
+```
+
+With `happy_eyeballs => false`, a hostname resolves IPv4-first (then IPv6)
+unless `family => inet6` is set. A hostname that fails to resolve returns
+`{error, Reason}` rather than connecting to a default address.
 
 ### 0-RTT Session Resumption
 

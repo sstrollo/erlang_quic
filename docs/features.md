@@ -11,6 +11,8 @@
   cancel and reschedule a timer on every packet
 - [x] Version negotiation
 - [x] Retry packets for address validation
+- [x] IPv6 client connections: hostname, IP-literal (bracketed or bare), or `inet:ip_address()` tuple host
+- [x] Happy Eyeballs v2 (RFC 8305): dual-stack hostnames race IPv6-first, with `happy_eyeballs`, `family`, `connection_attempt_delay` and `connect_timeout` options on `quic:connect/4`
 - [x] Latency spin bit (RFC 9000 §17.4) with `spin_bit => true | false`
 - [x] NEW_TOKEN frame dispatch (server rejects peer-received tokens per §8.1.3); client caches received tokens keyed by `{Host, Port}` and reuses them in the Initial of the next connect to the same endpoint
 - [x] Stateless reset (RFC 9000 §10.3): listener emits resets for orphan packets; per-connection `NEW_CONNECTION_ID` tokens share the listener's HMAC secret so they match orphan-path tokens

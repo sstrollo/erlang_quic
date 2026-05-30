@@ -55,6 +55,24 @@ also advertise `secp256r1`.
 | `max_streams_uni` | integer | 100 | Max unidirectional streams |
 | `max_datagram_frame_size` | integer | 0 | Datagram support (0 = disabled, RFC 9221) |
 
+### Socket Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `extra_socket_opts` | list() | `[]` | Extra options for the listener socket |
+
+Pass `inet6` (or an IPv6 `{ip, Addr}`) in `extra_socket_opts` to listen on
+IPv6. The address family is inferred from these options; the default is IPv4.
+
+```erlang
+%% Listen on the IPv6 wildcard
+quic:start_server(my_server, 4433, Opts#{extra_socket_opts => [inet6]}).
+
+%% Bind to a specific IPv6 address
+quic:start_server(my_server, 4433,
+    Opts#{extra_socket_opts => [{ip, {16#2001, 16#db8, 0, 0, 0, 0, 0, 1}}]}).
+```
+
 ### Server Pool Options
 
 | Option | Type | Default | Description |
