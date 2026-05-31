@@ -41,6 +41,7 @@
 
     %% Retransmission
     retransmittable_frames/1,
+    stream_has_unacked_below/3,
 
     %% Loss detection
     detect_lost_packets/2,
@@ -584,6 +585,27 @@ ack_delay_to_ms(AckDelay, #loss_state{}) ->
 -spec retransmittable_frames([term()]) -> [term()].
 retransmittable_frames(Frames) ->
     lists:filter(fun is_retransmittable/1, Frames).
+
+%% True if any in-flight sent packet carries STREAM data for StreamId that
+%% starts before ReliableSize. Data at/after ReliableSize is never retransmitted
+%% for a RESET_STREAM_AT stream, so it does not gate the reliable obligation.
+-spec stream_has_unacked_below(loss_state(), non_neg_integer(), non_neg_integer()) ->
+    boolean().
+stream_has_unacked_below(#loss_state{sent_q = Q}, StreamId, ReliableSize) ->
+    lists:any(
+        fun(#sent_packet{frames = Fs}) ->
+            lists:any(
+                fun
+                    ({stream, S, Off, _Data, _Fin}) ->
+                        S =:= StreamId andalso Off < ReliableSize;
+                    (_) ->
+                        false
+                end,
+                Fs
+            )
+        end,
+        queue:to_list(Q)
+    ).
 
 %% Check if a frame is retransmittable
 is_retransmittable(padding) -> false;

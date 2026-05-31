@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- Streams aborted with RESET_STREAM_AT are reclaimed from the connection's stream map once their reliable obligation is met (local reset: reliable bytes acked; incoming reset: reliable bytes delivered), instead of being retained for the life of the connection. Data beyond the reliable size is trimmed from the send queue and retransmit path, and dropped on receive. (#152)
+- A lost-packet retransmission deferred by congestion control is re-queued and resent when the window reopens, instead of being dropped (it had already been removed from the sent queue, so it was never retried).
+
 ## [1.5.0] - 2026-05-30
 
 ### Added

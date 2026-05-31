@@ -379,3 +379,27 @@ retransmittable_filters_all_datagrams_test() ->
     ],
     Result = quic_loss:retransmittable_frames(Frames),
     ?assertEqual([], Result).
+
+%%====================================================================
+%% stream_has_unacked_below/3 (RESET_STREAM_AT reliable-reclaim gate)
+%%====================================================================
+
+stream_has_unacked_below_empty_test() ->
+    ?assertNot(quic_loss:stream_has_unacked_below(quic_loss:new(), 4, 100)).
+
+stream_has_unacked_below_test() ->
+    S0 = quic_loss:new(),
+    %% In-flight STREAM data for stream 4 starting at offset 50.
+    S1 = quic_loss:on_packet_sent(S0, 0, 100, true, [{stream, 4, 50, <<"a">>, false}]),
+    ?assert(quic_loss:stream_has_unacked_below(S1, 4, 100)),
+    ?assert(quic_loss:stream_has_unacked_below(S1, 4, 51)),
+    %% Boundary at/below the frame's start offset is not "below".
+    ?assertNot(quic_loss:stream_has_unacked_below(S1, 4, 50)),
+    ?assertNot(quic_loss:stream_has_unacked_below(S1, 4, 10)),
+    %% Different stream id never matches.
+    ?assertNot(quic_loss:stream_has_unacked_below(S1, 8, 100)).
+
+stream_has_unacked_below_ignores_non_stream_test() ->
+    S0 = quic_loss:new(),
+    S1 = quic_loss:on_packet_sent(S0, 0, 50, true, [ping, {max_data, 1000}]),
+    ?assertNot(quic_loss:stream_has_unacked_below(S1, 12, 100)).

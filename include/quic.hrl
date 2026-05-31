@@ -589,10 +589,13 @@
     deadline_error_code = 16#FF :: non_neg_integer(),
 
     %% RESET_STREAM_AT reliable size (draft-ietf-quic-reliable-stream-reset-07)
-    %% When set, data up to this offset must be delivered before reset takes effect
-    reset_reliable_size :: non_neg_integer() | undefined,
-    %% Error code from RESET_STREAM_AT (must not change once set)
-    reset_error :: non_neg_integer() | undefined
+    %% Direction-split: send_* is our local reset reliable size, recv_* is the
+    %% peer's. A bidi stream can carry both without clashing.
+    send_reset_at = undefined :: non_neg_integer() | undefined,
+    recv_reset_at = undefined :: non_neg_integer() | undefined,
+    %% Error codes from RESET_STREAM_AT (must not change once set)
+    send_reset_error = undefined :: non_neg_integer() | undefined,
+    recv_reset_error = undefined :: non_neg_integer() | undefined
 }).
 
 %% Sent packet info for loss detection

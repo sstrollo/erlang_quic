@@ -50,6 +50,13 @@
     reset_stream_at_ignore_increased_reliable_size/1
 ]).
 
+%% Test cases - Stream Reclaim (#152 follow-up)
+-export([
+    reset_stream_at_reclaims_full_reliable/1,
+    reset_stream_at_reclaims_partial_reliable/1,
+    reset_stream_at_reclaims_zero_reliable/1
+]).
+
 %%====================================================================
 %% CT Callbacks
 %%====================================================================
@@ -62,7 +69,8 @@ all() ->
         {group, transport_param},
         {group, basic},
         {group, error_handling},
-        {group, multiple_frames}
+        {group, multiple_frames},
+        {group, reclaim}
     ].
 
 groups() ->
@@ -84,6 +92,11 @@ groups() ->
         {multiple_frames, [sequence], [
             reset_stream_at_reduce_reliable_size,
             reset_stream_at_ignore_increased_reliable_size
+        ]},
+        {reclaim, [sequence], [
+            reset_stream_at_reclaims_full_reliable,
+            reset_stream_at_reclaims_partial_reliable,
+            reset_stream_at_reclaims_zero_reliable
         ]}
     ].
 
@@ -438,6 +451,77 @@ setup_connection(Config) ->
         end,
 
     {ClientRef, ServerConn, ServerName}.
+
+%%====================================================================
+%% Stream Reclaim Tests (#152 follow-up)
+%%====================================================================
+
+%% A locally-initiated unidirectional stream reset with ReliableSize equal to
+%% all sent data is reclaimed once that data is acked (send side terminal), and
+%% the peer reclaims its receive side once it has delivered the reliable bytes.
+reset_stream_at_reclaims_full_reliable(Config) ->
+    {ClientRef, ServerConn, _ServerName} = setup_connection(Config),
+    {ok, StreamId} = quic:open_unidirectional_stream(ClientRef),
+    Data = <<"reliable-payload-bytes">>,
+    ok = quic:send_data(ClientRef, StreamId, Data, false),
+    timer:sleep(50),
+    ok = quic:reset_stream_at(ClientRef, StreamId, 16#100, byte_size(Data)),
+    ?assert(wait_streams(ClientRef, 0, 5000)),
+    case ServerConn of
+        undefined -> ok;
+        _ -> ?assert(wait_streams(ServerConn, 0, 5000))
+    end,
+    quic:close(ClientRef),
+    ok.
+
+%% ReliableSize below the sent length: queued data beyond the boundary is
+%% trimmed, the reliable prefix is acked, and the stream is still reclaimed.
+reset_stream_at_reclaims_partial_reliable(Config) ->
+    {ClientRef, ServerConn, _ServerName} = setup_connection(Config),
+    {ok, StreamId} = quic:open_unidirectional_stream(ClientRef),
+    Data = <<"prefix-keep|suffix-drop-this-tail">>,
+    ok = quic:send_data(ClientRef, StreamId, Data, false),
+    timer:sleep(50),
+    ok = quic:reset_stream_at(ClientRef, StreamId, 16#101, 11),
+    ?assert(wait_streams(ClientRef, 0, 5000)),
+    case ServerConn of
+        undefined -> ok;
+        _ -> ?assert(wait_streams(ServerConn, 0, 5000))
+    end,
+    quic:close(ClientRef),
+    ok.
+
+%% ReliableSize 0 (equivalent to RESET_STREAM): no reliable bytes are owed, so
+%% the send side is terminal immediately and the stream is reclaimed.
+reset_stream_at_reclaims_zero_reliable(Config) ->
+    {ClientRef, ServerConn, _ServerName} = setup_connection(Config),
+    {ok, StreamId} = quic:open_unidirectional_stream(ClientRef),
+    ok = quic:send_data(ClientRef, StreamId, <<"discarded-on-reset">>, false),
+    timer:sleep(50),
+    ok = quic:reset_stream_at(ClientRef, StreamId, 16#102, 0),
+    ?assert(wait_streams(ClientRef, 0, 5000)),
+    case ServerConn of
+        undefined -> ok;
+        _ -> ?assert(wait_streams(ServerConn, 0, 5000))
+    end,
+    quic:close(ClientRef),
+    ok.
+
+%% Poll a connection's live stream count until it reaches Expected.
+wait_streams(_Conn, _Expected, Timeout) when Timeout =< 0 ->
+    false;
+wait_streams(Conn, Expected, Timeout) ->
+    case stream_count(Conn) of
+        Expected ->
+            true;
+        _ ->
+            timer:sleep(50),
+            wait_streams(Conn, Expected, Timeout - 50)
+    end.
+
+stream_count(Conn) ->
+    {_StateName, Map} = gen_statem:call(Conn, get_state),
+    maps:get(streams, Map).
 
 %%====================================================================
 %% Certificate Generation

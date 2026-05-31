@@ -399,6 +399,13 @@
     reclaimed_ranges_bidi = #{} :: #{local | peer => [{non_neg_integer(), non_neg_integer()}]},
     reclaimed_ranges_uni = #{} :: #{local | peer => [{non_neg_integer(), non_neg_integer()}]},
 
+    %% StreamId => send reliable size, for local RESET_STREAM_AT streams whose
+    %% data below the reliable size is not yet fully acked. Drained as acks arrive.
+    pending_send_reset_at = #{} :: #{non_neg_integer() => non_neg_integer()},
+    %% Lost control-frame retransmissions deferred by congestion control, replayed
+    %% through the CC-checked retransmit path when cwnd reopens.
+    deferred_ctrl_retransmits = [] :: [term()],
+
     %% Datagram support (RFC 9221)
     %% Local: our advertised max size (0 = disabled)
     max_datagram_frame_size_local = 0 :: non_neg_integer(),
@@ -4426,10 +4433,16 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                     %% Reset PTO timer after ACK processing
                     State5 = set_pto_timer(State4),
 
-                    %% Try to send queued data now that cwnd may have freed up
+                    %% Try to send queued data now that cwnd may have freed up.
+                    %% This also drains retransmit_stream entries deferred by CC.
                     State6 = process_send_queue(State5),
+                    %% cwnd reopened: replay CC-deferred control retransmits, then
+                    %% complete any local reset-at reclaim whose reliable bytes are
+                    %% now acked.
+                    State7 = flush_deferred_retransmits(State6),
+                    State8 = complete_send_reset_at(State7),
                     %% Event-driven flush: flush batch and timers after ACK processing
-                    flush_dirty_timers(flush_socket_batch(State6))
+                    flush_dirty_timers(flush_socket_batch(State8))
                 %% close inner case (on_ack_received)
             end
         %% close outer case (Ranges)
@@ -4669,7 +4682,7 @@ process_frame(
                         {connection_close, transport, ?QUIC_STREAM_STATE_ERROR, 0,
                             <<"RESET_STREAM_AT final_size changed">>},
                     send_frame(CloseFrame, State#state{close_reason = stream_state_error});
-                {ok, #stream_state{reset_error = ExistingError}} when
+                {ok, #stream_state{recv_reset_error = ExistingError}} when
                     ExistingError =/= undefined andalso ExistingError =/= ErrorCode
                 ->
                     %% STREAM_STATE_ERROR: ErrorCode changed
@@ -4677,26 +4690,29 @@ process_frame(
                         {connection_close, transport, ?QUIC_STREAM_STATE_ERROR, 0,
                             <<"RESET_STREAM_AT error_code changed">>},
                     send_frame(CloseFrame, State#state{close_reason = stream_state_error});
-                {ok, #stream_state{reset_reliable_size = ExistingReliable}} when
+                {ok, #stream_state{recv_reset_at = ExistingReliable}} when
                     ExistingReliable =/= undefined andalso ReliableSize > ExistingReliable
                 ->
                     %% Spec: Ignore if ReliableSize increased (not an error, just ignore)
                     State;
                 {ok, Stream} ->
-                    %% Valid RESET_STREAM_AT - update stream state
+                    %% Valid RESET_STREAM_AT - update stream state. The recv side
+                    %% is terminal once the reliable bytes are already delivered.
+                    Delivered = Stream#stream_state.recv_offset >= ReliableSize,
                     NewStreams = maps:put(
                         StreamId,
                         Stream#stream_state{
                             state = reset,
                             final_size = FinalSize,
-                            reset_reliable_size = ReliableSize,
-                            reset_error = ErrorCode
+                            recv_reset_at = ReliableSize,
+                            recv_reset_error = ErrorCode,
+                            recv_done = Delivered orelse Stream#stream_state.recv_done
                         },
                         Streams
                     ),
                     %% Notify owner - same message as RESET_STREAM
                     Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
-                    State#state{streams = NewStreams};
+                    maybe_reclaim_stream(StreamId, State#state{streams = NewStreams});
                 error ->
                     case is_reclaimed_frame(StreamId, State) of
                         true ->
@@ -4707,7 +4723,9 @@ process_frame(
                                 true ->
                                     stream_limit_close(State);
                                 false ->
-                                    %% Unknown stream - notify owner and create minimal state
+                                    %% Unknown stream - notify owner and create minimal state.
+                                    %% A fresh stream has recv_offset 0, so the recv side is
+                                    %% terminal immediately only when ReliableSize is 0.
                                     Owner ! {quic, self(), {stream_opened, StreamId}},
                                     NewStreams = maps:put(
                                         StreamId,
@@ -4715,13 +4733,16 @@ process_frame(
                                             id = StreamId,
                                             state = reset,
                                             final_size = FinalSize,
-                                            reset_reliable_size = ReliableSize,
-                                            reset_error = ErrorCode
+                                            recv_reset_at = ReliableSize,
+                                            recv_reset_error = ErrorCode,
+                                            recv_done = (ReliableSize =:= 0)
                                         },
                                         Streams
                                     ),
                                     Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
-                                    State#state{streams = NewStreams}
+                                    maybe_reclaim_stream(
+                                        StreamId, State#state{streams = NewStreams}
+                                    )
                             end
                     end
             end
@@ -4884,20 +4905,32 @@ remove_stream_from_queue(StreamId, PQ) ->
         lists:foldl(
             fun(I, {Queues, Bytes, Count}) ->
                 Q = element(I, PQ),
-                %% Calculate bytes + entry count to remove before filtering
+                %% Calculate bytes + entry count to remove before filtering.
+                %% Both stream_data and retransmit_stream entries can be queued.
                 {BytesToRemove, CountToRemove} = queue:fold(
-                    fun({stream_data, SId, _, _Data, _, DataSize}, {BAcc, CAcc}) ->
-                        case SId of
-                            StreamId -> {BAcc + DataSize, CAcc + 1};
-                            _ -> {BAcc, CAcc}
-                        end
+                    fun
+                        ({Tag, SId, _, _Data, _, DataSize}, {BAcc, CAcc}) when
+                            (Tag =:= stream_data orelse Tag =:= retransmit_stream) andalso
+                                SId =:= StreamId
+                        ->
+                            {BAcc + DataSize, CAcc + 1};
+                        (_, Acc) ->
+                            Acc
                     end,
                     {0, 0},
                     Q
                 ),
                 %% Filter to keep only other streams
                 Kept = queue:filter(
-                    fun({stream_data, SId, _, _, _, _}) -> SId =/= StreamId end, Q
+                    fun
+                        ({Tag, SId, _, _, _, _}) when
+                            Tag =:= stream_data orelse Tag =:= retransmit_stream
+                        ->
+                            SId =/= StreamId;
+                        (_) ->
+                            true
+                    end,
+                    Q
                 ),
                 {[Kept | Queues], Bytes + BytesToRemove, Count + CountToRemove}
             end,
@@ -6002,6 +6035,34 @@ stream_state_error_close(StreamId, Reason, State) ->
     close_with_transport_error(?QUIC_STREAM_STATE_ERROR, Reason, State).
 
 do_process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
+    %% If the peer sent RESET_STREAM_AT, it aborted beyond ReliableSize: data at
+    %% or after the boundary must not be delivered (clamp), and a frame fully
+    %% beyond it is dropped outright.
+    case clamp_recv_reset_at(StreamId, Offset, Data, Fin, State) of
+        drop ->
+            State;
+        {ClampedData, ClampedFin} ->
+            do_process_stream_data_buffered(StreamId, Offset, ClampedData, ClampedFin, State)
+    end.
+
+%% Drop data at/after recv_reset_at, truncate a straddling chunk to the boundary
+%% (clearing Fin). Returns drop | {Data, Fin}.
+clamp_recv_reset_at(StreamId, Offset, Data, Fin, State) ->
+    case maps:find(StreamId, State#state.streams) of
+        {ok, #stream_state{recv_reset_at = R}} when R =/= undefined ->
+            if
+                Offset >= R -> drop;
+                Offset + byte_size(Data) =< R -> {Data, Fin};
+                true -> {binary:part(Data, 0, R - Offset), false}
+            end;
+        _ ->
+            {Data, Fin}
+    end.
+
+recv_reset_at_met(#stream_state{recv_reset_at = R}, Off) ->
+    R =/= undefined andalso Off >= R.
+
+do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
     #state{
         owner = Owner,
         streams = Streams,
@@ -6187,6 +6248,7 @@ do_process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
                         final_size = FinalSize,
                         recv_done =
                             (DeliverFin andalso map_size(NewBuffer) =:= 0) orelse
+                                recv_reset_at_met(Stream, NewRecvOffset) orelse
                                 Stream#stream_state.recv_done
                     },
 
@@ -6990,13 +7052,9 @@ maybe_reclaim_stream(StreamId, #state{streams = Streams, role = Role} = State) -
             end
     end.
 
-%% A stream may be reclaimed once the direction(s) that apply to it are terminal
-%% and it carries no outstanding RESET_STREAM_AT obligation (the retransmit
-%% filter and reliable-delivery still depend on its state).
-stream_reclaimable(_StreamId, _Role, #stream_state{reset_reliable_size = RS}) when
-    RS =/= undefined
-->
-    false;
+%% A stream may be reclaimed once the direction(s) that apply to it are terminal.
+%% A RESET_STREAM_AT obligation folds into send_done/recv_done (set once the
+%% reliable bytes are acked / delivered), so it needs no special case here.
 stream_reclaimable(StreamId, Role, Stream) ->
     case stream_class(StreamId, Role) of
         {bidi, _} -> Stream#stream_state.send_done andalso Stream#stream_state.recv_done;
@@ -8010,6 +8068,16 @@ process_send_queue(#state{send_queue = PQ} = State) ->
                 {blocked, _Reason} ->
                     %% Flow control blocked - leave in queue, wait for MAX_DATA
                     State
+            end;
+        {value, {retransmit_stream, _StreamId, _Offset, _Data, _Fin, DataSize}} ->
+            %% Retransmits are exempt from flow control (bytes already counted),
+            %% but still gated by congestion control via the retransmit allowance.
+            case quic_cc:can_send_control(State#state.cc_state, DataSize + ?PACKET_OVERHEAD) of
+                true ->
+                    process_send_queue_entry(State);
+                false ->
+                    %% cwnd still blocking - leave queued, retried on next ACK
+                    State
             end
     end.
 
@@ -8055,6 +8123,28 @@ process_send_queue_entry(
     case pqueue_out(PQ) of
         {empty, _} ->
             State;
+        {{value, {retransmit_stream, StreamId, Offset, Data, Fin, DataSize}}, NewPQ} ->
+            %% Lost data being retransmitted: send via the CC-checked retransmit
+            %% path. No data_sent bump and no flow-control consumption (those were
+            %% accounted on the original send). If CC blocks again,
+            %% send_retransmit_frames_cc/2 re-enqueues it (version bump stops the
+            %% drain loop below).
+            State1 = State#state{
+                send_queue = NewPQ,
+                send_queue_bytes = max(0, QueueBytes - DataSize),
+                send_queue_count = max(0, QueueCount - 1)
+            },
+            Frame = {stream, StreamId, Offset, Data, Fin},
+            State2 = send_retransmit_frames_cc([Frame], State1),
+            case pqueue_is_empty(State2#state.send_queue) of
+                true ->
+                    State2;
+                false ->
+                    case State2#state.send_queue_version =:= State1#state.send_queue_version of
+                        true -> process_send_queue(State2);
+                        false -> State2
+                    end
+            end;
         {{value, {stream_data, StreamId, Offset, Data, Fin, DataSize}}, NewPQ} ->
             %% Decrement queue bytes and entry count for dequeued data.
             %% DataSize is cached in entry; if data is re-queued,
@@ -8267,8 +8357,8 @@ do_reset_stream_at_with_stream(StreamId, ErrorCode, ReliableSize, StreamState, S
     end.
 
 validate_reset_stream_at(ReliableSize, FinalSize, ErrorCode, StreamState) ->
-    ExistingReliable = StreamState#stream_state.reset_reliable_size,
-    ExistingError = StreamState#stream_state.reset_error,
+    ExistingReliable = StreamState#stream_state.send_reset_at,
+    ExistingError = StreamState#stream_state.send_reset_error,
     case ReliableSize > FinalSize of
         true ->
             {error, {invalid_reliable_size, ReliableSize, FinalSize}};
@@ -8300,7 +8390,7 @@ execute_reset_stream_at(
     ReliableSize,
     FinalSize,
     StreamState,
-    #state{streams = Streams} = State
+    State
 ) ->
     %% Cancel deadline timer if any
     case StreamState#stream_state.deadline_timer of
@@ -8314,12 +8404,124 @@ execute_reset_stream_at(
     TruncatedBuffer = truncate_send_buffer(StreamState#stream_state.send_buffer, ReliableSize),
     UpdatedStream = StreamState#stream_state{
         state = reset,
-        reset_reliable_size = ReliableSize,
-        reset_error = ErrorCode,
+        send_reset_at = ReliableSize,
+        send_reset_error = ErrorCode,
         send_buffer = TruncatedBuffer,
         deadline_timer = undefined
     },
-    {ok, NewState#state{streams = maps:put(StreamId, UpdatedStream, Streams)}}.
+    %% Drop queued STREAM data at/after ReliableSize; keep < ReliableSize for
+    %% delivery (the reliable-reset guarantee).
+    State1 = trim_stream_send_queue(StreamId, ReliableSize, NewState),
+    State2 = State1#state{streams = maps:put(StreamId, UpdatedStream, State1#state.streams)},
+    {ok, settle_send_reset_at(StreamId, State2)}.
+
+%% Send side of a local RESET_STREAM_AT is done once no data below ReliableSize
+%% remains queued or in flight. Until then, track it so the ack path can finish
+%% the reclaim when the last reliable bytes are acked.
+settle_send_reset_at(StreamId, State) ->
+    RS = (maps:get(StreamId, State#state.streams))#stream_state.send_reset_at,
+    Pending =
+        stream_has_queued_below(StreamId, RS, State#state.send_queue) orelse
+            quic_loss:stream_has_unacked_below(State#state.loss_state, StreamId, RS),
+    case Pending of
+        false ->
+            mark_send_done_and_reclaim(StreamId, State);
+        true ->
+            State#state{
+                pending_send_reset_at =
+                    maps:put(StreamId, RS, State#state.pending_send_reset_at)
+            }
+    end.
+
+%% Mark the send side terminal and try to reclaim. recv_done (for bidi) still
+%% gates the actual removal inside maybe_reclaim_stream/2.
+mark_send_done_and_reclaim(StreamId, State) ->
+    case maps:find(StreamId, State#state.streams) of
+        {ok, S} ->
+            State1 = State#state{
+                streams = maps:put(
+                    StreamId, S#stream_state{send_done = true}, State#state.streams
+                )
+            },
+            maybe_reclaim_stream(StreamId, State1);
+        error ->
+            State
+    end.
+
+%% Drop queued STREAM/retransmit entries for StreamId at/after ReliableSize;
+%% truncate a straddling entry to ReliableSize - Offset (clearing Fin); keep
+%% entries fully below. Mirrors remove_stream_from_queue/2 bookkeeping and bumps
+%% send_queue_version since entry payloads change.
+trim_stream_send_queue(StreamId, ReliableSize, #state{send_queue = PQ} = State) ->
+    {NewQueues, RemovedBytes, RemovedCount} =
+        lists:foldl(
+            fun(I, {Queues, Bytes, Count}) ->
+                {Kept, DBytes, DCount} = trim_bucket(element(I, PQ), StreamId, ReliableSize),
+                {[Kept | Queues], Bytes + DBytes, Count + DCount}
+            end,
+            {[], 0, 0},
+            lists:seq(1, 8)
+        ),
+    State#state{
+        send_queue = list_to_tuple(lists:reverse(NewQueues)),
+        send_queue_bytes = max(0, State#state.send_queue_bytes - RemovedBytes),
+        send_queue_count = max(0, State#state.send_queue_count - RemovedCount),
+        send_queue_version = State#state.send_queue_version + 1
+    }.
+
+%% Trim one priority bucket. DCount counts fully-dropped entries only (a
+%% truncated entry stays in the queue).
+trim_bucket(Q, StreamId, ReliableSize) ->
+    lists:foldl(
+        fun(Entry, {QAcc, DBytes, DCount}) ->
+            case trim_entry(Entry, StreamId, ReliableSize) of
+                keep ->
+                    {queue:in(Entry, QAcc), DBytes, DCount};
+                {truncate, NewEntry, Removed} ->
+                    {queue:in(NewEntry, QAcc), DBytes + Removed, DCount};
+                {drop, Removed} ->
+                    {QAcc, DBytes + Removed, DCount + 1}
+            end
+        end,
+        {queue:new(), 0, 0},
+        queue:to_list(Q)
+    ).
+
+trim_entry({Tag, SId, Offset, Data, _Fin, DataSize}, StreamId, ReliableSize) when
+    (Tag =:= stream_data orelse Tag =:= retransmit_stream) andalso SId =:= StreamId
+->
+    if
+        Offset >= ReliableSize ->
+            {drop, DataSize};
+        Offset + DataSize =< ReliableSize ->
+            keep;
+        true ->
+            KeepLen = ReliableSize - Offset,
+            Truncated = binary:part(iolist_to_binary(Data), 0, KeepLen),
+            {truncate, {Tag, SId, Offset, Truncated, false, KeepLen}, DataSize - KeepLen}
+    end;
+trim_entry(_Entry, _StreamId, _ReliableSize) ->
+    keep.
+
+%% True if the send queue holds STREAM/retransmit data for StreamId starting
+%% before ReliableSize (reliable bytes still owed).
+stream_has_queued_below(StreamId, ReliableSize, PQ) ->
+    lists:any(
+        fun(I) ->
+            lists:any(
+                fun
+                    ({Tag, SId, Offset, _Data, _Fin, _DataSize}) when
+                        Tag =:= stream_data orelse Tag =:= retransmit_stream
+                    ->
+                        SId =:= StreamId andalso Offset < ReliableSize;
+                    (_) ->
+                        false
+                end,
+                queue:to_list(element(I, PQ))
+            )
+        end,
+        lists:seq(1, 8)
+    ).
 
 %% Truncate send buffer to only keep data up to ReliableSize
 truncate_send_buffer(Buffer, ReliableSize) when is_list(Buffer) ->
@@ -8724,21 +8926,32 @@ retransmit_lost_packets([#sent_packet{frames = Frames} | Rest], State) ->
 %% Per draft-ietf-quic-reliable-stream-reset-07: Data beyond ReliableSize
 %% SHOULD NOT be retransmitted
 filter_reset_stream_at_data(Frames, #state{streams = Streams}) ->
-    lists:filter(
+    lists:filtermap(
         fun(Frame) ->
             case Frame of
-                {stream, StreamId, Offset, _Data, _Fin} ->
+                {stream, StreamId, Offset, Data, _Fin} ->
                     case maps:find(StreamId, Streams) of
-                        {ok, #stream_state{reset_reliable_size = RS}} when RS =/= undefined ->
-                            %% Only retransmit if frame starts before ReliableSize
-                            Offset < RS;
+                        {ok, #stream_state{send_reset_at = RS}} when RS =/= undefined ->
+                            if
+                                %% Entirely beyond the boundary - drop
+                                Offset >= RS ->
+                                    false;
+                                %% Entirely below - retransmit unchanged
+                                Offset + byte_size(Data) =< RS ->
+                                    {true, Frame};
+                                %% Straddles - truncate to the boundary, clear Fin
+                                true ->
+                                    {true,
+                                        {stream, StreamId, Offset,
+                                            binary:part(Data, 0, RS - Offset), false}}
+                            end;
                         _ ->
                             %% No RESET_STREAM_AT - always retransmit
-                            true
+                            {true, Frame}
                     end;
                 _ ->
                     %% Non-stream frames - always retransmit
-                    true
+                    {true, Frame}
             end
         end,
         Frames
@@ -8758,8 +8971,12 @@ send_retransmit_frames_cc(Frames, #state{cc_state = CCState, retransmits = R} = 
         true ->
             send_app_packet_internal(Payload, Frames, State#state{retransmits = R + 1});
         false ->
-            %% CC doesn't allow - defer retransmission
-            %% The PTO mechanism will eventually retry this data
+            %% CC doesn't allow yet. detect_lost_packets/2 already pulled these
+            %% frames out of sent_q, so PTO would not retry them. Track them so
+            %% they are resent (and so a RESET_STREAM_AT reclaim does not complete
+            %% before its reliable bytes are actually re-delivered): stream data
+            %% into FC-exempt retransmit_stream queue entries, control frames into
+            %% deferred_ctrl_retransmits, both replayed when cwnd reopens.
             ?LOG_DEBUG(
                 #{
                     what => retransmit_deferred_by_cc,
@@ -8769,8 +8986,81 @@ send_retransmit_frames_cc(Frames, #state{cc_state = CCState, retransmits = R} = 
                 },
                 ?QUIC_LOG_META
             ),
-            State
+            defer_retransmit_frames(Frames, State)
     end.
+
+%% Split CC-deferred lost frames: stream data into FC-exempt retransmit_stream
+%% queue entries (retried by process_send_queue/1), control frames into
+%% deferred_ctrl_retransmits (replayed by flush_deferred_retransmits/1).
+defer_retransmit_frames(Frames, State) ->
+    lists:foldl(
+        fun
+            ({stream, SId, Off, D, F}, S) ->
+                enqueue_retransmit_stream(SId, Off, D, F, S);
+            (Ctrl, S) ->
+                S#state{
+                    deferred_ctrl_retransmits = S#state.deferred_ctrl_retransmits ++ [Ctrl]
+                }
+        end,
+        State,
+        Frames
+    ).
+
+%% Queue a lost STREAM frame for retransmission. Exempt from flow control and
+%% data_sent (those were counted on the original send); bytes/count/version are
+%% updated like queue_stream_data/5 so the drain and reclaim-gate scans see it.
+enqueue_retransmit_stream(StreamId, Offset, Data, Fin, State) ->
+    #state{
+        send_queue = PQ,
+        streams = Streams,
+        send_queue_bytes = QueueBytes,
+        send_queue_count = QueueCount,
+        send_queue_version = Version
+    } = State,
+    DataSize = iolist_size(Data),
+    Urgency = get_stream_urgency(StreamId, Streams),
+    Entry = {retransmit_stream, StreamId, Offset, Data, Fin, DataSize},
+    State#state{
+        send_queue = pqueue_in(Entry, Urgency, PQ),
+        send_queue_bytes = QueueBytes + DataSize,
+        send_queue_count = QueueCount + 1,
+        send_queue_version = Version + 1
+    }.
+
+%% Replay CC-deferred control retransmits through the same CC-checked path. NOT
+%% send_frame/2, which would bypass the congestion check. If cwnd is still
+%% blocking, send_retransmit_frames_cc/2 re-defers them back into the list.
+flush_deferred_retransmits(#state{deferred_ctrl_retransmits = []} = State) ->
+    State;
+flush_deferred_retransmits(#state{deferred_ctrl_retransmits = Deferred} = State) ->
+    send_retransmit_frames_cc(Deferred, State#state{deferred_ctrl_retransmits = []}).
+
+%% Drain pending local reset-at streams whose data below ReliableSize is now
+%% fully acked (no longer queued or in flight), completing the reclaim.
+complete_send_reset_at(#state{pending_send_reset_at = P} = State) when map_size(P) =:= 0 ->
+    State;
+complete_send_reset_at(#state{pending_send_reset_at = P} = State) ->
+    maps:fold(
+        fun(StreamId, RS, Acc) ->
+            Pending =
+                stream_has_queued_below(StreamId, RS, Acc#state.send_queue) orelse
+                    quic_loss:stream_has_unacked_below(Acc#state.loss_state, StreamId, RS),
+            case Pending of
+                true ->
+                    Acc;
+                false ->
+                    mark_send_done_and_reclaim(
+                        StreamId,
+                        Acc#state{
+                            pending_send_reset_at =
+                                maps:remove(StreamId, Acc#state.pending_send_reset_at)
+                        }
+                    )
+            end
+        end,
+        State,
+        P
+    ).
 
 %% Handle PTO timeout - send probe packet
 handle_pto_timeout(#state{loss_state = LossState} = State) ->
@@ -8781,8 +9071,13 @@ handle_pto_timeout(#state{loss_state = LossState} = State) ->
     %% Send probe packet (retransmit oldest unacked or send PING)
     State2 = send_probe_packet(State1),
 
+    %% Probes use the control allowance, so retry any CC-deferred control
+    %% retransmits here too (they are not in sent_q for the probe to pick up).
+    State2a = flush_deferred_retransmits(State2),
+    State2b = complete_send_reset_at(State2a),
+
     %% Flush immediately - probe packets and timers must not be batched
-    State3 = flush_dirty_timers(flush_socket_batch(State2)),
+    State3 = flush_dirty_timers(flush_socket_batch(State2b)),
 
     %% Set new PTO timer
     set_pto_timer(State3).
