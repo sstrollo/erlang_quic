@@ -553,6 +553,9 @@
     send_max_data :: non_neg_integer(),
     send_fin :: boolean(),
     send_buffer :: iolist(),
+    %% Our send side is terminal: FIN emitted or we sent RESET_STREAM. Used
+    %% (with recv_done) to reclaim the stream from the connection map.
+    send_done = false :: boolean(),
 
     %% Receive state
     recv_offset :: non_neg_integer(),
@@ -560,6 +563,8 @@
     recv_fin :: boolean(),
     %% #{Offset => Data} for out-of-order reassembly
     recv_buffer :: map(),
+    %% Our recv side is terminal: FIN read (buffer empty) or peer RESET_STREAM.
+    recv_done = false :: boolean(),
 
     %% Final size (set when FIN received)
     final_size :: non_neg_integer() | undefined,

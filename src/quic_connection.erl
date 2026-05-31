@@ -390,11 +390,14 @@
     max_streams_bidi_remote :: non_neg_integer(),
     max_streams_uni_local :: non_neg_integer(),
     max_streams_uni_remote :: non_neg_integer(),
-    %% RFC 9000 §4.6: peer-initiated streams already credited via
-    %% MAX_STREAMS, tracked so we do not double-issue credit when state
-    %% transitions are observed twice (e.g. recv-FIN then send-FIN).
-    credited_peer_bidi = sets:new([{version, 2}]) :: sets:set(non_neg_integer()),
-    credited_peer_uni = sets:new([{version, 2}]) :: sets:set(non_neg_integer()),
+    %% Reclaimed-stream tracker (RFC 9000 §2.1: ids are never reused). Per
+    %% initiator (local | peer), a sorted list of disjoint {Lo, Hi} intervals
+    %% of normalised stream indexes (StreamId bsr 2). Lets us distinguish a
+    %% late/retransmitted frame for an already-reclaimed stream from a genuinely
+    %% new one without retaining per-stream state. Bounded by concurrent open
+    %% streams (the holes), not the total opened.
+    reclaimed_ranges_bidi = #{} :: #{local | peer => [{non_neg_integer(), non_neg_integer()}]},
+    reclaimed_ranges_uni = #{} :: #{local | peer => [{non_neg_integer(), non_neg_integer()}]},
 
     %% Datagram support (RFC 9221)
     %% Local: our advertised max size (0 = disabled)
@@ -4603,35 +4606,43 @@ process_frame(
                     <<"RESET_STREAM final size mismatch">>},
             send_frame(CloseFrame, State#state{close_reason = final_size_error});
         {ok, Stream} ->
-            %% Mark stream as reset, store final size for flow control accounting
+            %% Mark stream as reset, store final size for flow control accounting.
+            %% Incoming RESET_STREAM closes our receive side.
             NewStreams = maps:put(
                 StreamId,
                 Stream#stream_state{
                     state = reset,
-                    final_size = FinalSize
+                    final_size = FinalSize,
+                    recv_done = true
                 },
                 Streams
             ),
             Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
-            State#state{streams = NewStreams};
+            maybe_reclaim_stream(StreamId, State#state{streams = NewStreams});
         error ->
-            case exceeds_stream_limit(StreamId, State) of
+            case is_reclaimed_frame(StreamId, State) of
                 true ->
-                    stream_limit_close(State);
+                    %% Late RESET_STREAM for an already-reclaimed stream; ignore.
+                    State;
                 false ->
-                    %% Unknown stream - notify owner and create minimal state to track reset
-                    Owner ! {quic, self(), {stream_opened, StreamId}},
-                    NewStreams = maps:put(
-                        StreamId,
-                        #stream_state{
-                            id = StreamId,
-                            state = reset,
-                            final_size = FinalSize
-                        },
-                        Streams
-                    ),
-                    Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
-                    State#state{streams = NewStreams}
+                    case exceeds_stream_limit(StreamId, State) of
+                        true ->
+                            stream_limit_close(State);
+                        false ->
+                            %% Unknown stream - notify owner and create minimal state to track reset
+                            Owner ! {quic, self(), {stream_opened, StreamId}},
+                            NewStreams = maps:put(
+                                StreamId,
+                                #stream_state{
+                                    id = StreamId,
+                                    state = reset,
+                                    final_size = FinalSize
+                                },
+                                Streams
+                            ),
+                            Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
+                            State#state{streams = NewStreams}
+                    end
             end
     end;
 %% RESET_STREAM_AT: Peer is aborting a stream with reliable delivery guarantee
@@ -4687,25 +4698,31 @@ process_frame(
                     Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
                     State#state{streams = NewStreams};
                 error ->
-                    case exceeds_stream_limit(StreamId, State) of
+                    case is_reclaimed_frame(StreamId, State) of
                         true ->
-                            stream_limit_close(State);
+                            %% Late RESET_STREAM_AT for an already-reclaimed stream; ignore.
+                            State;
                         false ->
-                            %% Unknown stream - notify owner and create minimal state
-                            Owner ! {quic, self(), {stream_opened, StreamId}},
-                            NewStreams = maps:put(
-                                StreamId,
-                                #stream_state{
-                                    id = StreamId,
-                                    state = reset,
-                                    final_size = FinalSize,
-                                    reset_reliable_size = ReliableSize,
-                                    reset_error = ErrorCode
-                                },
-                                Streams
-                            ),
-                            Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
-                            State#state{streams = NewStreams}
+                            case exceeds_stream_limit(StreamId, State) of
+                                true ->
+                                    stream_limit_close(State);
+                                false ->
+                                    %% Unknown stream - notify owner and create minimal state
+                                    Owner ! {quic, self(), {stream_opened, StreamId}},
+                                    NewStreams = maps:put(
+                                        StreamId,
+                                        #stream_state{
+                                            id = StreamId,
+                                            state = reset,
+                                            final_size = FinalSize,
+                                            reset_reliable_size = ReliableSize,
+                                            reset_error = ErrorCode
+                                        },
+                                        Streams
+                                    ),
+                                    Owner ! {quic, self(), {stream_reset, StreamId, ErrorCode}},
+                                    State#state{streams = NewStreams}
+                            end
                     end
             end
     end;
@@ -4716,48 +4733,56 @@ process_frame(
     {stop_sending, StreamId, ErrorCode},
     #state{owner = Owner, streams = Streams} = State
 ) ->
-    case (not maps:is_key(StreamId, Streams)) andalso exceeds_stream_limit(StreamId, State) of
+    case is_reclaimed_frame(StreamId, State) of
         true ->
-            stream_limit_close(State);
+            %% Late STOP_SENDING for an already-reclaimed stream; ignore.
+            State;
         false ->
-            %% Clear any queued data for this stream and mark as stopped
-            NewStreams =
-                case maps:find(StreamId, Streams) of
-                    {ok, Stream} ->
-                        maps:put(
-                            StreamId,
-                            Stream#stream_state{
-                                state = stopped,
-                                % Clear queued data
-                                send_buffer = []
-                            },
-                            Streams
-                        );
-                    error ->
-                        %% Unknown stream - notify owner and create minimal state
-                        Owner ! {quic, self(), {stream_opened, StreamId}},
-                        maps:put(
-                            StreamId,
-                            #stream_state{
-                                id = StreamId,
-                                state = stopped
-                            },
-                            Streams
-                        )
-                end,
-            %% Notify owner - they should stop sending and may send RESET_STREAM
-            Owner ! {quic, self(), {stop_sending, StreamId, ErrorCode}},
-            %% Also remove from send queue and adjust byte / entry count
-            {NewSendQueue, RemovedBytes, RemovedCount} =
-                remove_stream_from_queue(StreamId, State#state.send_queue),
-            NewQueueBytes = max(0, State#state.send_queue_bytes - RemovedBytes),
-            NewQueueCount = max(0, State#state.send_queue_count - RemovedCount),
-            State#state{
-                streams = NewStreams,
-                send_queue = NewSendQueue,
-                send_queue_bytes = NewQueueBytes,
-                send_queue_count = NewQueueCount
-            }
+            case
+                (not maps:is_key(StreamId, Streams)) andalso exceeds_stream_limit(StreamId, State)
+            of
+                true ->
+                    stream_limit_close(State);
+                false ->
+                    %% Clear any queued data for this stream and mark as stopped
+                    NewStreams =
+                        case maps:find(StreamId, Streams) of
+                            {ok, Stream} ->
+                                maps:put(
+                                    StreamId,
+                                    Stream#stream_state{
+                                        state = stopped,
+                                        % Clear queued data
+                                        send_buffer = []
+                                    },
+                                    Streams
+                                );
+                            error ->
+                                %% Unknown stream - notify owner and create minimal state
+                                Owner ! {quic, self(), {stream_opened, StreamId}},
+                                maps:put(
+                                    StreamId,
+                                    #stream_state{
+                                        id = StreamId,
+                                        state = stopped
+                                    },
+                                    Streams
+                                )
+                        end,
+                    %% Notify owner - they should stop sending and may send RESET_STREAM
+                    Owner ! {quic, self(), {stop_sending, StreamId, ErrorCode}},
+                    %% Also remove from send queue and adjust byte / entry count
+                    {NewSendQueue, RemovedBytes, RemovedCount} =
+                        remove_stream_from_queue(StreamId, State#state.send_queue),
+                    NewQueueBytes = max(0, State#state.send_queue_bytes - RemovedBytes),
+                    NewQueueCount = max(0, State#state.send_queue_count - RemovedCount),
+                    State#state{
+                        streams = NewStreams,
+                        send_queue = NewSendQueue,
+                        send_queue_bytes = NewQueueBytes,
+                        send_queue_count = NewQueueCount
+                    }
+            end
     end;
 %% STREAM_DATA_BLOCKED: Peer is blocked by stream-level flow control
 %% RFC 9000 Section 19.13: Receipt opens the stream (Section 3.2)
@@ -4771,22 +4796,29 @@ process_frame(
             %% Stream already exists, nothing to do (informational frame)
             State;
         false ->
-            case exceeds_stream_limit(StreamId, State) of
+            case is_reclaimed_frame(StreamId, State) of
                 true ->
-                    stream_limit_close(State);
+                    %% Late STREAM_DATA_BLOCKED for an already-reclaimed stream; ignore.
+                    State;
                 false ->
-                    %% New stream from peer - notify owner
-                    Owner ! {quic, self(), {stream_opened, StreamId}},
-                    %% Create minimal stream state
-                    InitSendMaxData = get_peer_stream_limit(bidi_peer_initiated, State),
-                    InitRecvMaxData = get_local_recv_limit(bidi_peer_initiated, State),
-                    NewStream = #stream_state{
-                        id = StreamId,
-                        state = open,
-                        send_max_data = InitSendMaxData,
-                        recv_max_data = InitRecvMaxData
-                    },
-                    State#state{streams = maps:put(StreamId, NewStream, Streams)}
+                    case exceeds_stream_limit(StreamId, State) of
+                        true ->
+                            stream_limit_close(State);
+                        false ->
+                            %% New stream from peer - notify owner
+                            Owner ! {quic, self(), {stream_opened, StreamId}},
+                            %% Create minimal stream state with limits for the stream type
+                            Kind = peer_stream_kind(StreamId),
+                            InitSendMaxData = get_peer_stream_limit(Kind, State),
+                            InitRecvMaxData = get_local_recv_limit(Kind, State),
+                            NewStream = #stream_state{
+                                id = StreamId,
+                                state = open,
+                                send_max_data = InitSendMaxData,
+                                recv_max_data = InitRecvMaxData
+                            },
+                            State#state{streams = maps:put(StreamId, NewStream, Streams)}
+                    end
             end
     end;
 %% DATA_BLOCKED: Peer is blocked by connection-level flow control (informational)
@@ -5940,6 +5972,20 @@ validate_receive_stream(StreamId, Role) ->
     end.
 
 process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
+    case
+        (not is_map_key(StreamId, State#state.streams)) andalso
+            stream_reclaimed(StreamId, State#state.role, State)
+    of
+        true ->
+            %% Late/retransmitted frame for an already-reclaimed stream. Stream
+            %% ids are never reused (RFC 9000 §2.1), so this is never a new
+            %% stream; ignore it rather than resurrecting the record.
+            State;
+        false ->
+            do_process_stream_data_validated(StreamId, Offset, Data, Fin, State)
+    end.
+
+do_process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
     #state{
         owner = Owner,
         streams = Streams,
@@ -6122,7 +6168,10 @@ process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
                         recv_offset = NewRecvOffset,
                         recv_fin = DeliverFin,
                         recv_buffer = NewBuffer,
-                        final_size = FinalSize
+                        final_size = FinalSize,
+                        recv_done =
+                            (DeliverFin andalso map_size(NewBuffer) =:= 0) orelse
+                                Stream#stream_state.recv_done
                     },
 
                     %% Track connection-level data received - only count NEW bytes, not duplicates
@@ -6140,14 +6189,14 @@ process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
                         0, RecvBufferBytes + NewBytesReceived - DeliveredBytes
                     ),
 
-                    State1Pre = State#state{
+                    State1 = State#state{
                         streams = maps:put(StreamId, NewStream, Streams),
                         data_received = NewDataReceivedVal,
                         recv_buffer_bytes = NewRecvBufferBytes
                     },
-                    %% RFC 9000 §4.6: extend MAX_STREAMS when the peer-
-                    %% initiated stream becomes fully closed.
-                    State1 = maybe_credit_peer_stream(StreamId, State1Pre),
+                    %% The stream is reclaimed at the end of this clause (after the
+                    %% MAX_STREAM_DATA / MAX_DATA updates, which re-put the stream),
+                    %% so a terminal stream is not re-inserted after removal.
 
                     %% Check if we need to send MAX_STREAM_DATA to allow more data.
                     %% Trigger when remaining sender headroom (max - delivered) drops
@@ -6275,8 +6324,10 @@ process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
                                 State2
                         end,
 
-                    %% ACK is sent at packet level by maybe_send_ack
-                    State3
+                    %% ACK is sent at packet level by maybe_send_ack.
+                    %% Reclaim last: if both directions are now terminal, drop the
+                    %% stream from the map (RFC 9000 §4.6 / memory reclamation).
+                    maybe_reclaim_stream(StreamId, State3)
                 % end of FinalSizeError case
             end
     end.
@@ -6901,82 +6952,159 @@ flush_dirty_timers(#state{pto_dirty = false} = State) ->
 flush_dirty_timers(#state{pto_dirty = true} = State) ->
     set_pto_timer(State#state{pto_dirty = false}).
 
-%% RFC 9000 §4.6: as peer-initiated streams reach their final state we
-%% extend the MAX_STREAMS credit by one and send a MAX_STREAMS frame so
-%% the peer can keep opening streams. Each stream is credited at most
-%% once (tracked via credited_peer_bidi/credited_peer_uni sets).
-maybe_credit_peer_stream(StreamId, State) ->
-    case maps:find(StreamId, State#state.streams) of
+%% Reclaim a stream once every direction that applies to it is terminal.
+%% Removes the #stream_state{} from the connection map, records the id in the
+%% reclaimed-range tracker (so a late/retransmitted frame is not mistaken for a
+%% new stream, RFC 9000 §2.1), and for a peer-initiated stream extends the
+%% MAX_STREAMS credit by one (RFC 9000 §4.6). Runs at most once per stream:
+%% later calls miss the map and no-op, so crediting is exactly-once.
+maybe_reclaim_stream(StreamId, #state{streams = Streams, role = Role} = State) ->
+    case maps:find(StreamId, Streams) of
         error ->
             State;
         {ok, Stream} ->
-            case classify_peer_stream(StreamId, State#state.role) of
-                {peer, bidi} ->
-                    case stream_fully_closed_bidi(Stream) of
-                        true -> credit_peer_bidi(StreamId, State);
-                        false -> State
-                    end;
-                {peer, uni} ->
-                    case stream_fully_closed_uni(Stream) of
-                        true -> credit_peer_uni(StreamId, State);
-                        false -> State
-                    end;
-                local ->
-                    State
+            case stream_reclaimable(StreamId, Role, Stream) of
+                false ->
+                    State;
+                true ->
+                    cancel_stream_deadline_timer(Stream),
+                    State1 = State#state{streams = maps:remove(StreamId, Streams)},
+                    State2 = record_reclaimed(StreamId, Role, State1),
+                    credit_peer_on_reclaim(StreamId, Role, State2)
             end
     end.
 
-%% Bidi stream is final when both directions have FIN'd.
-stream_fully_closed_bidi(#stream_state{recv_fin = true, send_fin = true}) -> true;
-stream_fully_closed_bidi(_) -> false.
+%% A stream may be reclaimed once the direction(s) that apply to it are terminal
+%% and it carries no outstanding RESET_STREAM_AT obligation (the retransmit
+%% filter and reliable-delivery still depend on its state).
+stream_reclaimable(_StreamId, _Role, #stream_state{reset_reliable_size = RS}) when
+    RS =/= undefined
+->
+    false;
+stream_reclaimable(StreamId, Role, Stream) ->
+    case stream_class(StreamId, Role) of
+        {bidi, _} -> Stream#stream_state.send_done andalso Stream#stream_state.recv_done;
+        {uni, local} -> Stream#stream_state.send_done;
+        {uni, peer} -> Stream#stream_state.recv_done
+    end.
 
-%% Peer-initiated uni streams are receive-only on our side; FIN from peer
-%% closes them.
-stream_fully_closed_uni(#stream_state{recv_fin = true}) -> true;
-stream_fully_closed_uni(_) -> false.
-
-%% Stream ID layout (RFC 9000 §2.1):
-%%   bit 0 = initiator (0 client, 1 server)
-%%   bit 1 = direction (0 bidi, 1 uni)
-classify_peer_stream(StreamId, Role) ->
-    Initiator = StreamId band 1,
-    Uni = (StreamId band 2) =/= 0,
-    PeerInitiated =
-        case Role of
-            server -> Initiator =:= 0;
-            client -> Initiator =:= 1
+%% {Direction, Initiator} from the two low stream-id bits (RFC 9000 §2.1):
+%%   bit 0 = initiator (0 client, 1 server), bit 1 = direction (0 bidi, 1 uni).
+stream_class(StreamId, Role) ->
+    Dir =
+        case (StreamId band 2) =/= 0 of
+            true -> uni;
+            false -> bidi
         end,
-    case {PeerInitiated, Uni} of
-        {true, false} -> {peer, bidi};
-        {true, true} -> {peer, uni};
-        _ -> local
+    Init =
+        case stream_locally_initiated(StreamId, Role) of
+            true -> local;
+            false -> peer
+        end,
+    {Dir, Init}.
+
+stream_locally_initiated(StreamId, Role) ->
+    Initiator = StreamId band 1,
+    case Role of
+        client -> Initiator =:= 0;
+        server -> Initiator =:= 1
     end.
 
-credit_peer_bidi(StreamId, #state{credited_peer_bidi = Set} = State) ->
-    case sets:is_element(StreamId, Set) of
-        true ->
-            State;
-        false ->
-            NewMax = State#state.max_streams_bidi_local + 1,
-            State1 = State#state{
-                max_streams_bidi_local = NewMax,
-                credited_peer_bidi = sets:add_element(StreamId, Set)
-            },
-            send_frame({max_streams, bidi, NewMax}, State1)
+%% Flow-control limit key for a peer-created stream, by direction.
+peer_stream_kind(StreamId) ->
+    case (StreamId band 2) =/= 0 of
+        true -> uni_peer_initiated;
+        false -> bidi_peer_initiated
     end.
 
-credit_peer_uni(StreamId, #state{credited_peer_uni = Set} = State) ->
-    case sets:is_element(StreamId, Set) of
-        true ->
-            State;
-        false ->
-            NewMax = State#state.max_streams_uni_local + 1,
-            State1 = State#state{
-                max_streams_uni_local = NewMax,
-                credited_peer_uni = sets:add_element(StreamId, Set)
-            },
-            send_frame({max_streams, uni, NewMax}, State1)
+credit_peer_on_reclaim(StreamId, Role, State) ->
+    case stream_class(StreamId, Role) of
+        {bidi, peer} ->
+            N = State#state.max_streams_bidi_local + 1,
+            send_frame({max_streams, bidi, N}, State#state{max_streams_bidi_local = N});
+        {uni, peer} ->
+            N = State#state.max_streams_uni_local + 1,
+            send_frame({max_streams, uni, N}, State#state{max_streams_uni_local = N});
+        _ ->
+            State
     end.
+
+cancel_stream_deadline_timer(#stream_state{deadline_timer = undefined}) ->
+    ok;
+cancel_stream_deadline_timer(#stream_state{deadline_timer = Timer}) ->
+    _ = erlang:cancel_timer(Timer),
+    ok.
+
+%% Drop any queued STREAM frames for a stream and adjust the queue counters, so
+%% nothing buffered is emitted after a local RESET_STREAM.
+purge_stream_send_queue(StreamId, State) ->
+    {NewQueue, RemovedBytes, RemovedCount} =
+        remove_stream_from_queue(StreamId, State#state.send_queue),
+    State#state{
+        send_queue = NewQueue,
+        send_queue_bytes = max(0, State#state.send_queue_bytes - RemovedBytes),
+        send_queue_count = max(0, State#state.send_queue_count - RemovedCount)
+    }.
+
+%%====================================================================
+%% Reclaimed-stream tracking (RFC 9000 §2.1: stream ids never reused)
+%%====================================================================
+
+%% Record a reclaimed stream as a normalised index (StreamId bsr 2) in the
+%% per-class disjoint interval list, so a frame for an already-reclaimed stream
+%% can be told apart from a genuinely new one without per-stream state.
+record_reclaimed(StreamId, Role, State) ->
+    {Dir, Init} = stream_class(StreamId, Role),
+    Map0 = reclaimed_map(Dir, State),
+    Ranges0 = maps:get(Init, Map0, []),
+    Ranges1 = interval_add(StreamId bsr 2, Ranges0),
+    set_reclaimed_map(Dir, maps:put(Init, Ranges1, Map0), State).
+
+stream_reclaimed(StreamId, Role, State) ->
+    {Dir, Init} = stream_class(StreamId, Role),
+    interval_member(StreamId bsr 2, maps:get(Init, reclaimed_map(Dir, State), [])).
+
+%% True when a frame's stream is not in the map but was already reclaimed: a
+%% late/retransmitted frame that must be ignored rather than recreate the stream
+%% (RFC 9000 §2.1: ids are never reused). Used by every open-on-miss handler.
+is_reclaimed_frame(StreamId, #state{streams = Streams, role = Role} = State) ->
+    (not is_map_key(StreamId, Streams)) andalso stream_reclaimed(StreamId, Role, State).
+
+reclaimed_map(bidi, State) -> State#state.reclaimed_ranges_bidi;
+reclaimed_map(uni, State) -> State#state.reclaimed_ranges_uni.
+
+set_reclaimed_map(bidi, M, State) -> State#state{reclaimed_ranges_bidi = M};
+set_reclaimed_map(uni, M, State) -> State#state{reclaimed_ranges_uni = M}.
+
+%% Insert Idx into a sorted list of disjoint inclusive {Lo, Hi} intervals,
+%% merging adjacent (gap of 0) and overlapping ranges. Adjacency is +1 on the
+%% normalised index, which is stride-4 on the raw stream id.
+interval_add(Idx, []) ->
+    [{Idx, Idx}];
+interval_add(Idx, [{Lo, _Hi} | _] = Ranges) when Idx < Lo - 1 ->
+    [{Idx, Idx} | Ranges];
+interval_add(Idx, [{Lo, Hi} | Rest]) when Idx =:= Lo - 1 ->
+    [{Idx, Hi} | Rest];
+interval_add(Idx, [{Lo, Hi} | Rest]) when Idx >= Lo, Idx =< Hi ->
+    [{Lo, Hi} | Rest];
+interval_add(Idx, [{Lo, Hi} | Rest]) when Idx =:= Hi + 1 ->
+    interval_merge_next({Lo, Idx}, Rest);
+interval_add(Idx, [{Lo, Hi} | Rest]) ->
+    [{Lo, Hi} | interval_add(Idx, Rest)].
+
+interval_merge_next({Lo, Hi}, [{Lo2, Hi2} | Rest]) when Lo2 =< Hi + 1 ->
+    [{Lo, max(Hi, Hi2)} | Rest];
+interval_merge_next(Interval, Rest) ->
+    [Interval | Rest].
+
+interval_member(_Idx, []) ->
+    false;
+interval_member(Idx, [{Lo, Hi} | _]) when Idx >= Lo, Idx =< Hi ->
+    true;
+interval_member(Idx, [{Lo, _Hi} | _]) when Idx < Lo ->
+    false;
+interval_member(Idx, [_ | Rest]) ->
+    interval_member(Idx, Rest).
 
 %% Open a new stream
 %% Stream ID patterns: Bit 0=initiator (0=client, 1=server), Bit 1=type (0=bidi, 1=uni)
@@ -7310,9 +7438,13 @@ do_send_data(
                                     %% and subsequent sends must not overlap.
                                     case maps:find(StreamId, NewState#state.streams) of
                                         {ok, UpdatedStream} ->
+                                            SendFin = (Fin andalso BytesSent =:= DataSize),
                                             FinalStream = UpdatedStream#stream_state{
                                                 send_offset = Offset + DataSize,
-                                                send_fin = (Fin andalso BytesSent =:= DataSize)
+                                                send_fin = SendFin,
+                                                send_done =
+                                                    SendFin orelse
+                                                        UpdatedStream#stream_state.send_done
                                             },
                                             FinalState0 = NewState#state{
                                                 streams = maps:put(
@@ -7322,7 +7454,7 @@ do_send_data(
                                             },
                                             %% RFC 9000 §4.6: extend MAX_STREAMS when this
                                             %% peer-initiated stream is now fully closed.
-                                            FinalState = maybe_credit_peer_stream(
+                                            FinalState = maybe_reclaim_stream(
                                                 StreamId, FinalState0
                                             ),
                                             {ok, FinalState};
@@ -7356,7 +7488,8 @@ do_send_zero_rtt_data(
             %% Update stream state and track early data sent
             NewStreamState = StreamState#stream_state{
                 send_offset = Offset + byte_size(DataBin),
-                send_fin = Fin
+                send_fin = Fin,
+                send_done = Fin orelse StreamState#stream_state.send_done
             },
             EarlyDataSent = State#state.early_data_sent + byte_size(DataBin),
 
@@ -7366,7 +7499,7 @@ do_send_zero_rtt_data(
             },
             %% RFC 9000 §4.6: extend MAX_STREAMS once this stream is fully
             %% closed (covers the rare 0-RTT FIN-from-server case).
-            {ok, maybe_credit_peer_stream(StreamId, FinalState0)};
+            {ok, maybe_reclaim_stream(StreamId, FinalState0)};
         error ->
             {error, unknown_stream}
     end.
@@ -8054,11 +8187,15 @@ do_close_stream(StreamId, ErrorCode, #state{streams = Streams} = State) ->
             NewState = send_frame(ResetFrame, State),
             UpdatedStream = StreamState#stream_state{
                 state = reset,
-                deadline_timer = undefined
+                deadline_timer = undefined,
+                send_done = true
             },
-            {ok, NewState#state{
-                streams = maps:put(StreamId, UpdatedStream, Streams)
-            }};
+            %% Purge any queued STREAM frames so nothing is sent after the reset.
+            State1 = purge_stream_send_queue(StreamId, NewState),
+            State2 = State1#state{
+                streams = maps:put(StreamId, UpdatedStream, State1#state.streams)
+            },
+            {ok, maybe_reclaim_stream(StreamId, State2)};
         error ->
             {error, unknown_stream}
     end.
@@ -8338,16 +8475,20 @@ do_close_stream_deadline(StreamId, ErrorCode, #state{streams = Streams} = State)
             FinalSize = StreamState#stream_state.send_offset,
             ResetFrame = {reset_stream, StreamId, ErrorCode, FinalSize},
             NewState = send_frame(ResetFrame, State),
-            %% Mark stream as reset but keep in map for cleanup
+            %% Local RESET_STREAM closes our send side; purge any queued frames
+            %% so nothing is emitted after the reset, then reclaim if terminal.
             NewStreamState = StreamState#stream_state{
                 state = reset,
                 send_buffer = [],
+                send_done = true,
                 deadline = undefined,
                 deadline_timer = undefined
             },
-            {ok, NewState#state{
-                streams = maps:put(StreamId, NewStreamState, Streams)
-            }};
+            State1 = purge_stream_send_queue(StreamId, NewState),
+            State2 = State1#state{
+                streams = maps:put(StreamId, NewStreamState, State1#state.streams)
+            },
+            {ok, maybe_reclaim_stream(StreamId, State2)};
         error ->
             {error, unknown_stream}
     end.
