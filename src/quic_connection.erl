@@ -1651,6 +1651,18 @@ idle({call, From}, open_stream, #state{early_keys = _EarlyKeys} = State) ->
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
+%% 0-RTT: HTTP/3 opens its control and QPACK unidirectional streams as early
+%% data, so the idle state must allow opening uni streams once early keys are
+%% present (mirrors open_stream above).
+idle({call, From}, open_unidirectional_stream, #state{early_keys = undefined} = State) ->
+    {keep_state, State, [{reply, From, {error, not_connected}}]};
+idle({call, From}, open_unidirectional_stream, #state{early_keys = _EarlyKeys} = State) ->
+    case do_open_unidirectional_stream(State) of
+        {ok, StreamId, NewState} ->
+            {keep_state, NewState, [{reply, From, {ok, StreamId}}]};
+        {error, Reason} ->
+            {keep_state, State, [{reply, From, {error, Reason}}]}
+    end;
 %% 0-RTT: Allow sending data in idle state if early keys are available
 idle(
     {call, From},
@@ -2806,9 +2818,26 @@ validate_client_psk_selection(undefined, #state{external_psk = undefined}) ->
 validate_client_psk_selection(undefined, #state{external_psk = _Offered}) ->
     %% Client offered, server didn't select.
     {error, server_did_not_select_psk};
-validate_client_psk_selection(_Idx, #state{external_psk = undefined}) ->
-    %% Server selected but we didn't offer — protocol violation.
-    {error, unexpected_psk_selection};
+validate_client_psk_selection(
+    Idx,
+    #state{external_psk = undefined, server_name = ServerName, ticket_store = TicketStore}
+) ->
+    %% No external PSK was offered, so the server must have selected the
+    %% resumption ticket we offered. Re-derive that PSK from the stored
+    %% ticket; QUIC always uses psk_dhe_ke (the ECDHE share is present in
+    %% the ClientHello).
+    case quic_ticket:lookup_ticket(ServerName, TicketStore) of
+        {ok, #session_ticket{} = Ticket} when Idx =:= 0 ->
+            %% Single-identity resumption offer: index 0 is the only valid
+            %% choice. Re-derive the PSK the binder/early secret used.
+            PSK = quic_ticket:derive_psk(Ticket#session_ticket.resumption_secret, Ticket),
+            {ok, #{identity => Ticket#session_ticket.ticket, secret => PSK, mode => psk_dhe_ke}};
+        {ok, #session_ticket{}} ->
+            {error, selected_psk_index_out_of_range};
+        error ->
+            %% Server selected a PSK we never offered (or it expired).
+            {error, unexpected_psk_selection}
+    end;
 validate_client_psk_selection(Idx, #state{external_psk = {Identity, Secret}}) ->
     validate_client_psk_selection(Idx, Identity, Secret, [psk_dhe_ke]);
 validate_client_psk_selection(Idx, #state{external_psk = {Identity, Secret, Modes}}) ->
