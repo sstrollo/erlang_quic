@@ -7635,10 +7635,12 @@ send_zero_rtt_packet(Payload, EarlyKeys, State) ->
 %% application protocol (e.g. HTTP/3) can re-issue the affected requests.
 %% RFC 9001 §4.6.2. No RESET_STREAM frame is sent on the wire because
 %% the server never accepted these streams; both sides discard locally.
-%% Connection-level flow-control accounting is left untouched: 0-RTT
-%% bytes were sent under the resumed limits, and the new 1-RTT keys
-%% bring fresh `initial_max_data' / `initial_max_stream_data_*'
-%% allowances from the server's transport parameters.
+%% `data_sent' is left untouched: the 0-RTT send path never added these
+%% bytes to it (they are tracked in `early_data_sent'), and the new 1-RTT
+%% keys bring a fresh `initial_max_data' from the server's transport
+%% parameters. `early_data_sent' is cleared because the abandoned bytes
+%% are re-issued on new 1-RTT streams that count against `data_sent'
+%% afresh.
 -spec reset_zero_rtt_streams([non_neg_integer()], #state{}) -> #state{}.
 reset_zero_rtt_streams([], State) ->
     State;
@@ -7655,16 +7657,22 @@ reset_zero_rtt_streams(RejectedIds, #state{streams = Streams, owner = Owner} = S
     Owner ! {quic, self(), {early_data_rejected, RejectedIds}},
     State#state{
         streams = NewStreams,
-        zero_rtt_stream_ids = sets:new([{version, 2}])
+        zero_rtt_stream_ids = sets:new([{version, 2}]),
+        early_data_sent = 0
     }.
 
-%% Branch on early_data_accepted at handshake completion: when 0-RTT
-%% was rejected, reset stream state for every stream that carried
-%% 0-RTT data; when accepted, leave the state untouched.
-%% RFC 9001 §4.6.2.
+%% Branch on early_data_accepted at handshake completion. When 0-RTT was
+%% rejected, reset stream state for every stream that carried 0-RTT data
+%% (RFC 9001 §4.6.2). When accepted, the server received the 0-RTT data,
+%% so it counts toward connection-level flow control: fold the
+%% separately-tracked `early_data_sent' into `data_sent' (RFC 9000 §4.1).
+%% The 0-RTT send path only accumulates `early_data_sent' and never
+%% touches `data_sent', so without this fold the connection counter would
+%% under-count accepted early data and could later overshoot max_data.
 -spec finalize_zero_rtt_state(#state{}) -> #state{}.
 finalize_zero_rtt_state(#state{early_data_accepted = true} = State) ->
-    State;
+    #state{data_sent = DataSent, early_data_sent = EarlyDataSent} = State,
+    State#state{data_sent = DataSent + EarlyDataSent, early_data_sent = 0};
 finalize_zero_rtt_state(#state{early_data_accepted = false} = State) ->
     case sets:to_list(State#state.zero_rtt_stream_ids) of
         [] -> State;
