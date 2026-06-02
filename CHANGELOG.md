@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.6.1] - 2026-06-02
+
+### Fixed
+- Server-side 0-RTT acceptance now works end to end. The server echoes the empty `early_data` extension in EncryptedExtensions when it accepts 0-RTT, so a resuming client reports `early_data_accepted/1 =:= true` instead of always seeing the data rejected. Inbound 0-RTT frames are dispatched at the application level, so the early request and its control/QPACK streams are processed rather than dropped, and the resumed request completes normally.
+
 ## [1.6.0] - 2026-06-02
 
 ### Added

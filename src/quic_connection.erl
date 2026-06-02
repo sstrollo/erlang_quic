@@ -2942,7 +2942,8 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
     %% Build EncryptedExtensions
     EncExtMsg = quic_tls:build_encrypted_extensions(#{
         alpn => ALPN,
-        transport_params => TransportParams
+        transport_params => TransportParams,
+        early_data => State#state.early_data_accepted
     }),
 
     %% PSK handshakes (RFC 8446 §4.6) skip CertificateRequest / Certificate /
@@ -4372,7 +4373,14 @@ process_frame_track_probing(Level, Frame, State) ->
                     false -> State#state{has_non_probing_frame = true}
                 end
         end,
-    process_frame(Level, Frame, State1).
+    %% 0-RTT shares the application packet number space and frame
+    %% semantics with 1-RTT (RFC 9001 §5.7). Dispatch its frames at the
+    %% app level so STREAM and flow-control frames are handled rather than
+    %% dropped by the catch-all clause.
+    process_frame(frame_dispatch_level(Level), Frame, State1).
+
+frame_dispatch_level(zero_rtt) -> app;
+frame_dispatch_level(Level) -> Level.
 
 %% Process individual frames
 process_frame(_Level, padding, State) ->
