@@ -28,7 +28,11 @@ setup() ->
 
 cleanup({started, Pid}) ->
     %% We started it, so we own its lifecycle.
-    catch gen_server:stop(Pid),
+    try
+        gen_server:stop(Pid)
+    catch
+        _:_ -> ok
+    end,
     ok;
 cleanup({existing, _Pid}) ->
     %% Supervised by quic_dist_sup; leave it running.

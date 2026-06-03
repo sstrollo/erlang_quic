@@ -114,7 +114,7 @@ test_not_connected() ->
                 %% Process must still be alive (no crash).
                 ?assert(is_process_alive(Conn))
             after
-                catch quic:close(Conn, normal)
+                quic:safe_close(Conn, normal)
             end;
         {error, _} ->
             %% Connect failed synchronously; the {error, _} guarantee
@@ -245,9 +245,17 @@ collect([Ref | Rest], Timeout) ->
 cleanup(TmpDir, ServerName, ConnRef) ->
     case ConnRef of
         undefined -> ok;
-        _ -> catch quic:close(ConnRef, normal)
+        _ -> quic:safe_close(ConnRef, normal)
     end,
     timer:sleep(50),
-    catch quic:stop_server(ServerName),
-    catch os:cmd("rm -rf " ++ TmpDir),
+    try
+        quic:stop_server(ServerName)
+    catch
+        _:_ -> ok
+    end,
+    try
+        os:cmd("rm -rf " ++ TmpDir)
+    catch
+        _:_ -> ok
+    end,
     ok.

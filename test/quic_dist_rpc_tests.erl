@@ -204,8 +204,16 @@ start_peer_nodes(TmpDir, CertFile, KeyFile) ->
 cleanup({skip, _}) ->
     ok;
 cleanup({#{peer1 := Peer1, peer2 := Peer2}, TmpDir}) ->
-    catch peer:stop(Peer1),
-    catch peer:stop(Peer2),
+    try
+        peer:stop(Peer1)
+    catch
+        _:_ -> ok
+    end,
+    try
+        peer:stop(Peer2)
+    catch
+        _:_ -> ok
+    end,
     os:cmd("rm -rf " ++ TmpDir),
     ok.
 

@@ -158,7 +158,11 @@ reset_stream_counters() ->
     ok.
 
 setup_meck(HasEarlyKeys) ->
-    catch meck:unload(quic),
+    try
+        meck:unload(quic)
+    catch
+        _:_ -> ok
+    end,
     meck:new(quic, [passthrough]),
     meck:expect(quic, set_owner_sync, fun(_, _) -> ok end),
     meck:expect(quic, close, fun(_) -> ok end),
@@ -184,7 +188,11 @@ setup_meck(HasEarlyKeys) ->
     ok.
 
 teardown_meck() ->
-    catch meck:unload(quic),
+    try
+        meck:unload(quic)
+    catch
+        _:_ -> ok
+    end,
     persistent_term:erase({?MODULE, uni_counter}),
     persistent_term:erase({?MODULE, bidi_counter}),
     ok.
@@ -315,9 +323,17 @@ check_request_results(Results, N) ->
     Sorted =:= Expected andalso length(Unique) =:= N.
 
 teardown_h3(H3, FakeQC) ->
-    catch unlink(H3),
+    try
+        unlink(H3)
+    catch
+        _:_ -> ok
+    end,
     wait_down(H3, shutdown),
-    catch unlink(FakeQC),
+    try
+        unlink(FakeQC)
+    catch
+        _:_ -> ok
+    end,
     wait_down(FakeQC, shutdown),
     ok.
 
@@ -326,7 +342,11 @@ teardown_h3(H3, FakeQC) ->
 %% next iteration (or the ?SETUP finalizer's meck:unload) runs.
 wait_down(Pid, Reason) ->
     MRef = erlang:monitor(process, Pid),
-    catch exit(Pid, Reason),
+    try
+        exit(Pid, Reason)
+    catch
+        _:_ -> ok
+    end,
     receive
         {'DOWN', MRef, process, Pid, _} -> ok
     after ?WAIT_MS ->

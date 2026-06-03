@@ -120,7 +120,11 @@ init_per_testcase(TestCase, Config) ->
 
 end_per_testcase(_TestCase, Config) ->
     ServerName = ?config(server_name, Config),
-    catch quic:stop_server(ServerName),
+    try
+        quic:stop_server(ServerName)
+    catch
+        _:_ -> ok
+    end,
     timer:sleep(50),
     ok.
 

@@ -48,7 +48,11 @@ start(Extra) when is_map(Extra) ->
 
 -spec stop(handle()) -> ok.
 stop(#{name := Name}) ->
-    catch quic_h3:stop_server(Name),
+    try
+        quic_h3:stop_server(Name)
+    catch
+        _:_ -> ok
+    end,
     ok.
 
 %%====================================================================

@@ -289,7 +289,7 @@ start_h3_connection(QuicConn, HostBin, Port, Opts) ->
             ok = quic_h3_connection:prime(H3Conn),
             maybe_wait_connected(H3Conn, Opts);
         {error, Reason} ->
-            quic:close(QuicConn, 0, <<"h3 init failed">>),
+            quic:safe_close(QuicConn, 0, <<"h3 init failed">>),
             {error, Reason}
     end.
 

@@ -74,8 +74,16 @@ decode_key(KeyPem) ->
     end.
 
 cleanup_server_only(TmpDir, ServerName) ->
-    catch quic:stop_server(ServerName),
-    catch os:cmd("rm -rf " ++ TmpDir),
+    try
+        quic:stop_server(ServerName)
+    catch
+        _:_ -> ok
+    end,
+    try
+        os:cmd("rm -rf " ++ TmpDir)
+    catch
+        _:_ -> ok
+    end,
     ok.
 
 %%====================================================================

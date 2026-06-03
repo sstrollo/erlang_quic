@@ -256,7 +256,11 @@ start_psk_only_server(Extra) ->
     {ok, #{name => Name, port => Port}}.
 
 stop_server(#{name := Name}) ->
-    catch quic:stop_server(Name),
+    try
+        quic:stop_server(Name)
+    catch
+        _:_ -> ok
+    end,
     ok.
 
 connect_with_psk(#{port := Port}, PskOffer) ->
@@ -300,7 +304,7 @@ await_outcome(ConnRef, Timeout) ->
         {quic, ConnRef, {closed, Reason}} ->
             {error, Reason}
     after Timeout ->
-        catch quic:close(ConnRef, timeout),
+        quic:safe_close(ConnRef, timeout),
         {error, timeout}
     end.
 
@@ -308,7 +312,7 @@ wait_connected(ConnRef, Timeout) ->
     receive
         {quic, ConnRef, {connected, _Info}} -> ok
     after Timeout ->
-        catch quic:close(ConnRef, timeout),
+        quic:safe_close(ConnRef, timeout),
         ct:fail("Connection timeout")
     end.
 

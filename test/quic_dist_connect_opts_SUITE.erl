@@ -38,11 +38,19 @@ all() ->
 
 init_per_testcase(_Name, Config) ->
     %% Drop any leftover entry from a previous test.
-    catch ets:delete(quic_dist_connect_opts),
+    try
+        ets:delete(quic_dist_connect_opts)
+    catch
+        _:_ -> ok
+    end,
     Config.
 
 end_per_testcase(_Name, _Config) ->
-    catch ets:delete(quic_dist_connect_opts),
+    try
+        ets:delete(quic_dist_connect_opts)
+    catch
+        _:_ -> ok
+    end,
     ok.
 
 %%====================================================================

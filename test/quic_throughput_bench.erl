@@ -114,7 +114,11 @@ run_download_sink(Opts) ->
             retransmits => Retransmits
         }
     after
-        catch quic_test_echo_server:stop(Srv)
+        try
+            quic_test_echo_server:stop(Srv)
+        catch
+            _:_ -> ok
+        end
     end.
 
 start_download_server(Extra) ->

@@ -556,7 +556,7 @@ init({server, QuicConn, Opts, Owner}) ->
     {ok, awaiting_quic, State}.
 
 terminate(_Reason, _StateName, #state{quic_conn = QuicConn}) ->
-    catch quic:close(QuicConn),
+    quic:safe_close(QuicConn),
     ok.
 
 code_change(_OldVsn, StateName, State, _Extra) ->
@@ -1263,7 +1263,7 @@ goaway_received(_EventType, _Event, _State) ->
 %%====================================================================
 
 closing(enter, _OldState, #state{quic_conn = QuicConn, owner = Owner}) ->
-    catch quic:close(QuicConn),
+    quic:safe_close(QuicConn),
     Owner ! {quic_h3, self(), closed},
     {stop, normal};
 closing(
@@ -2582,9 +2582,9 @@ handle_request_frame(
 handle_request_frame(
     StreamId,
     {data, Payload},
-    Fin,
+    _Fin,
     #h3_stream{frame_state = expecting_data} = Stream,
-    State
+    _State
 ) when (byte_size(Stream#h3_stream.body) + byte_size(Payload)) > ?H3_MAX_BUFFERED_BODY ->
     %% Without a Content-Length the body buffer would otherwise grow with
     %% the stream; cap it (RFC 9114 §4.1 allows H3_EXCESSIVE_LOAD).
@@ -3390,11 +3390,15 @@ parse_priority_params([Param | Rest], Urgency, Incremental) ->
     Trimmed = string:trim(Param),
     case Trimmed of
         <<"u=", UBin/binary>> ->
-            case catch binary_to_integer(UBin) of
+            try binary_to_integer(UBin) of
                 U when is_integer(U), U >= 0, U =< 7 ->
                     parse_priority_params(Rest, U, Incremental);
                 _ ->
                     %% Invalid urgency - use default
+                    parse_priority_params(Rest, Urgency, Incremental)
+            catch
+                _:_ ->
+                    %% Not an integer - use default
                     parse_priority_params(Rest, Urgency, Incremental)
             end;
         <<"i">> ->
@@ -4436,9 +4440,21 @@ maybe_close_if_drained(State) ->
 handle_connection_error(
     {connection_error, ErrorCode, Reason}, #state{quic_conn = QuicConn, owner = Owner} = State
 ) ->
-    Owner ! {quic_h3, self(), {error, ErrorCode, Reason}},
-    catch quic:close(QuicConn, ErrorCode, Reason),
+    %% Some call sites forward a non-binary decode reason; quic:close/3
+    %% requires a binary phrase, so coerce before sending CONNECTION_CLOSE.
+    Phrase = reason_phrase(Reason),
+    Owner ! {quic_h3, self(), {error, ErrorCode, Phrase}},
+    quic:safe_close(QuicConn, ErrorCode, Phrase),
     {next_state, closing, State}.
+
+reason_phrase(Reason) when is_binary(Reason) ->
+    Reason;
+reason_phrase(Reason) ->
+    try
+        iolist_to_binary(Reason)
+    catch
+        _:_ -> iolist_to_binary(io_lib:format("~0p", [Reason]))
+    end.
 
 notify_stream_reset(StreamId, ErrorCode, #state{owner = Owner}) ->
     Owner ! {quic_h3, self(), {stream_reset, StreamId, ErrorCode}}.

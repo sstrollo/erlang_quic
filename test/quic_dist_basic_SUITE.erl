@@ -113,8 +113,16 @@ end_per_group(two_node, Config) ->
     Peer1 = proplists:get_value(peer1, Config),
     Peer2 = proplists:get_value(peer2, Config),
 
-    catch peer:stop(Peer1),
-    catch peer:stop(Peer2),
+    try
+        peer:stop(Peer1)
+    catch
+        _:_ -> ok
+    end,
+    try
+        peer:stop(Peer2)
+    catch
+        _:_ -> ok
+    end,
     ok;
 end_per_group(_Group, _Config) ->
     ok.

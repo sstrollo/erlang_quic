@@ -39,7 +39,7 @@ server_socket_backend_batching_off() ->
             Received = collect_echo(Conn, StreamId, <<>>, 5000),
             ?assertEqual(Payload, Received)
         after
-            catch quic:close(Conn)
+            quic:safe_close(Conn)
         end
     after
         quic_test_echo_server:stop(Srv)

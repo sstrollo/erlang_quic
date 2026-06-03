@@ -115,7 +115,7 @@ wait_connected(ConnRef) ->
     receive
         {quic, ConnRef, {connected, Info}} -> Info
     after 10000 ->
-        catch quic:close(ConnRef, timeout),
+        quic:safe_close(ConnRef, timeout),
         ct:fail("connection timeout")
     end.
 
@@ -133,7 +133,7 @@ try_connect(#{port := Port}, Opts) ->
                 {quic, ConnRef, {closed, R}} ->
                     {error, R}
             after 10000 ->
-                catch quic:close(ConnRef, timeout),
+                quic:safe_close(ConnRef, timeout),
                 {error, timeout}
             end
     end.

@@ -451,7 +451,12 @@ close(#socket_state{backend = adapter, adapter_close_fun = Fun}) ->
         undefined ->
             ok;
         F when is_function(F, 0) ->
-            _ = catch F(),
+            _ =
+                try
+                    F()
+                catch
+                    _:_ -> ok
+                end,
             ok
     end;
 close(#socket_state{owns_socket = false}) ->

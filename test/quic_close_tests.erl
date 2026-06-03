@@ -172,7 +172,11 @@ draining_handles_owner_exit_test() ->
     end,
 
     %% Cleanup - unlink from owner if still linked
-    catch unlink(Owner).
+    try
+        unlink(Owner)
+    catch
+        _:_ -> ok
+    end.
 
 %%====================================================================
 %% Synchronous close tests

@@ -32,7 +32,7 @@ reclaim_after_fin() ->
         %% Both directions are now terminal on the client, so the stream map
         %% must have been reclaimed back down (not stuck at N).
         ?assert(wait_streams_below(Conn, 5, 10000)),
-        catch quic:close(Conn)
+        quic:safe_close(Conn)
     after
         quic_test_echo_server:stop(Srv)
     end.
