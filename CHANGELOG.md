@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.6.3] - 2026-06-03
+
+### Added
+- `quic:safe_close/1,2,3` closes a connection and ignores any error if it is already gone, for teardown paths that must not crash.
+
+### Fixed
+- HTTP/3 connection errors now send a CONNECTION_CLOSE. `handle_connection_error` passed the error reason straight to `quic:close/3`, but several call sites supply a non-binary reason, which failed the function's binary guard and was swallowed by a surrounding `catch`, so the connection was left open. The reason is now coerced to a binary phrase.
+
+### Changed
+- Replaced the deprecated bare `catch` expressions in the library and test suites with `try ... catch`, clearing the OTP 27+ compiler warnings. CI now runs the unit tests on OTP 26, 27, 28 and 29 (the matrix previously collapsed to one OTP version per OS).
+
 ## [1.6.2] - 2026-06-03
 
 ### Fixed
