@@ -378,13 +378,16 @@ do_discover(HostVar, PortVar, Label) ->
             {skip, Label ++ " not configured (set " ++ HostVar ++ "/" ++ PortVar ++ ")"};
         Host ->
             PortStr = os:getenv(PortVar, "0"),
-            case (catch list_to_integer(PortStr)) of
+            try list_to_integer(PortStr) of
                 Port when is_integer(Port), Port > 0 ->
                     case probe_udp(Host, Port) of
                         true -> {Host, Port};
                         false -> {skip, Label ++ " endpoint not reachable"}
                     end;
                 _ ->
+                    {skip, Label ++ " port invalid: " ++ PortStr}
+            catch
+                _:_ ->
                     {skip, Label ++ " port invalid: " ++ PortStr}
             end
     end.
@@ -582,15 +585,16 @@ assert_streams_dropped(Conn, RejectedIds) ->
     {_State, StateData} = sys:get_state(Conn, 1000),
     lists:foreach(
         fun(Id) ->
-            case catch quic_h3_connection:test_stream(Id, StateData) of
-                {'EXIT', {{badkey, Id}, _}} ->
-                    ok;
+            try quic_h3_connection:test_stream(Id, StateData) of
                 {error, _} ->
                     ok;
                 _ ->
                     %% If test_stream/2 ever returns the stream record,
                     %% that's a regression in the rejection plumbing.
                     ct:fail({stream_not_dropped, Id})
+            catch
+                error:{badkey, Id} ->
+                    ok
             end
         end,
         RejectedIds

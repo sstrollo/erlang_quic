@@ -37,7 +37,7 @@ ipv6_literal_brackets() ->
                         ?assert(false)
                     end
                 after
-                    catch quic:close(Conn)
+                    quic:safe_close(Conn)
                 end
             after
                 quic_test_echo_server:stop(Srv)

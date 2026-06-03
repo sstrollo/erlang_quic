@@ -115,10 +115,18 @@ stop_port(Port) ->
             os:cmd("kill " ++ integer_to_list(OsPid)),
             timer:sleep(200),
             os:cmd("kill -9 " ++ integer_to_list(OsPid) ++ " 2>/dev/null"),
-            catch erlang:port_close(Port),
+            try
+                erlang:port_close(Port)
+            catch
+                _:_ -> ok
+            end,
             ok;
         _ ->
-            catch erlang:port_close(Port),
+            try
+                erlang:port_close(Port)
+            catch
+                _:_ -> ok
+            end,
             ok
     end.
 
@@ -437,6 +445,10 @@ collect(Port, Acc, TimeoutMs) ->
             _ ->
                 ok
         end,
-        catch erlang:port_close(Port),
+        try
+            erlang:port_close(Port)
+        catch
+            _:_ -> ok
+        end,
         {binary_to_list(iolist_to_binary(lists:reverse(Acc))), 124}
     end.

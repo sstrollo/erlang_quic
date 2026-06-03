@@ -47,7 +47,7 @@ he_disabled_async() ->
             after 5000 -> ?assert(false)
             end
         after
-            catch quic:close(Conn)
+            quic:safe_close(Conn)
         end
     after
         quic_test_echo_server:stop(Srv)
@@ -70,7 +70,7 @@ tuple_host() ->
             after 5000 -> ?assert(false)
             end
         after
-            catch quic:close(Conn)
+            quic:safe_close(Conn)
         end
     after
         quic_test_echo_server:stop(Srv)
@@ -102,7 +102,7 @@ he_ipv6_winner() ->
                     {ok, {PeerIP, _}} = quic:peername(Conn),
                     ?assertEqual(8, tuple_size(PeerIP))
                 after
-                    catch quic:close(Conn)
+                    quic:safe_close(Conn)
                 end
             after
                 quic_test_echo_server:stop(Srv)

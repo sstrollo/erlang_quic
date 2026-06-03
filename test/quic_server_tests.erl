@@ -49,7 +49,12 @@ cleanup(_) ->
     lists:foreach(
         fun(Name) ->
             _ = quic:stop_server(Name),
-            _ = (catch quic_server_registry:unregister(Name))
+            _ =
+                (try
+                    quic_server_registry:unregister(Name)
+                catch
+                    _:_ -> ok
+                end)
         end,
         Servers
     ),
@@ -173,7 +178,12 @@ which_servers_test() ->
     lists:foreach(
         fun(N) ->
             _ = quic:stop_server(N),
-            _ = (catch quic_server_registry:unregister(N))
+            _ =
+                (try
+                    quic_server_registry:unregister(N)
+                catch
+                    _:_ -> ok
+                end)
         end,
         quic:which_servers()
     ),

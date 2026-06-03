@@ -79,10 +79,18 @@ decode_key(KeyPem) ->
     end.
 
 cleanup(TmpDir, ServerName, ConnRef) ->
-    catch quic:close(ConnRef, normal),
+    quic:safe_close(ConnRef, normal),
     timer:sleep(50),
-    catch quic:stop_server(ServerName),
-    catch os:cmd("rm -rf " ++ TmpDir),
+    try
+        quic:stop_server(ServerName)
+    catch
+        _:_ -> ok
+    end,
+    try
+        os:cmd("rm -rf " ++ TmpDir)
+    catch
+        _:_ -> ok
+    end,
     ok.
 
 %%====================================================================

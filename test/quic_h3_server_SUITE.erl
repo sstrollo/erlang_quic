@@ -358,7 +358,11 @@ exec_cmd_loop(Port, Acc, Timeout) ->
             Output = iolist_to_binary(lists:reverse(Acc)),
             {Status, Output}
     after Timeout ->
-        catch port_close(Port),
+        try
+            port_close(Port)
+        catch
+            _:_ -> ok
+        end,
         Output = iolist_to_binary(lists:reverse(Acc)),
         {timeout, Output}
     end.

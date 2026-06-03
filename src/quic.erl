@@ -78,6 +78,9 @@
     close/1,
     close/2,
     close/3,
+    safe_close/1,
+    safe_close/2,
+    safe_close/3,
     open_stream/1,
     open_unidirectional_stream/1,
     send_data/4,
@@ -330,6 +333,41 @@ close(Conn, ErrorCode, Reason) when
     is_binary(Reason)
 ->
     quic_connection:close(Conn, {app_error, ErrorCode, Reason}).
+
+%% @doc Close a connection, ignoring any error if it is already gone.
+%% For teardown paths that must not crash when the connection has
+%% already closed or the pid is dead.
+-spec safe_close(Conn) -> ok when
+    Conn :: pid().
+safe_close(Conn) ->
+    try
+        close(Conn)
+    catch
+        _:_ -> ok
+    end.
+
+%% @doc Like {@link safe_close/1} with a close reason.
+-spec safe_close(Conn, Reason) -> ok when
+    Conn :: pid(),
+    Reason :: non_neg_integer() | term().
+safe_close(Conn, Reason) ->
+    try
+        close(Conn, Reason)
+    catch
+        _:_ -> ok
+    end.
+
+%% @doc Like {@link safe_close/1} with an application error code and reason phrase.
+-spec safe_close(Conn, ErrorCode, Reason) -> ok when
+    Conn :: pid(),
+    ErrorCode :: 0..16#3FFFFFFFFFFFFFFF,
+    Reason :: binary().
+safe_close(Conn, ErrorCode, Reason) ->
+    try
+        close(Conn, ErrorCode, Reason)
+    catch
+        _:_ -> ok
+    end.
 
 %% @doc Open a new bidirectional stream.
 %% Returns {ok, StreamId} on success.

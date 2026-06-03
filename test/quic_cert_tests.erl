@@ -220,7 +220,7 @@ connect(Port, Opts0) ->
                 {quic, _, {error, Reason}} -> {error, Reason}
             after ?CONNECT_TIMEOUT -> timeout
             end,
-        catch quic:close(Conn),
+        quic:safe_close(Conn),
         Parent ! {result, self(), Result}
     end),
     receive
@@ -358,7 +358,11 @@ h3_setup() ->
 h3_cleanup(skip) ->
     ok;
 h3_cleanup(#{name := Name}) ->
-    catch quic:stop_server(Name),
+    try
+        quic:stop_server(Name)
+    catch
+        _:_ -> ok
+    end,
     ok.
 
 %% Connect over HTTP/3 to localhost and report whether the handshake
@@ -373,7 +377,11 @@ h3_connect(Port, Opts0) ->
     },
     case quic_h3:connect("127.0.0.1", Port, Opts) of
         {ok, Conn} ->
-            catch quic_h3:close(Conn),
+            try
+                quic_h3:close(Conn)
+            catch
+                _:_ -> ok
+            end,
             connected;
         {error, Reason} ->
             {error, Reason}

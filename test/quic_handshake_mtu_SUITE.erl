@@ -173,7 +173,7 @@ wait_connected(ConnRef) ->
     receive
         {quic, ConnRef, {connected, _Info}} -> ok
     after 10000 ->
-        catch quic:close(ConnRef, timeout),
+        quic:safe_close(ConnRef, timeout),
         ct:fail("connection timeout")
     end.
 

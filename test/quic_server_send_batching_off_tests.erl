@@ -13,9 +13,19 @@ server_socket_backend_batching_off_test_() ->
     %% Linux-only: detect_capabilities/0 only exposes the OTP socket
     %% NIF as the listener backend there. Elsewhere the bug this test
     %% targets (gen_udp:send/4 on an OTP socket handle) cannot fire.
-    case os:type() of
-        {unix, linux} -> [{timeout, 15, fun server_socket_backend_batching_off/0}];
+    %% The socket backend needs the OTP 27+ socket module (matching
+    %% quic_socket:otp_version_check/0); forcing it on OTP 26 cannot
+    %% complete the handshake.
+    case {os:type(), otp_27_plus()} of
+        {{unix, linux}, true} -> [{timeout, 15, fun server_socket_backend_batching_off/0}];
         _ -> []
+    end.
+
+otp_27_plus() ->
+    try
+        list_to_integer(erlang:system_info(otp_release)) >= 27
+    catch
+        _:_ -> false
     end.
 
 server_socket_backend_batching_off() ->
@@ -39,7 +49,7 @@ server_socket_backend_batching_off() ->
             Received = collect_echo(Conn, StreamId, <<>>, 5000),
             ?assertEqual(Payload, Received)
         after
-            catch quic:close(Conn)
+            quic:safe_close(Conn)
         end
     after
         quic_test_echo_server:stop(Srv)

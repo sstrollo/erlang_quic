@@ -78,8 +78,16 @@ init_per_group(_Group, Config) ->
     Config.
 
 end_per_group(two_node, Config) ->
-    catch peer:stop(?config(peer1, Config)),
-    catch peer:stop(?config(peer2, Config)),
+    try
+        peer:stop(?config(peer1, Config))
+    catch
+        _:_ -> ok
+    end,
+    try
+        peer:stop(?config(peer2, Config))
+    catch
+        _:_ -> ok
+    end,
     ok;
 end_per_group(_Group, _Config) ->
     ok.

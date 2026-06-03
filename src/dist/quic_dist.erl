@@ -124,14 +124,17 @@ select(Node) ->
         {node, Name, Host} ->
             %% Try to resolve address via EPMD module
             EpmdMod = net_kernel:epmd_module(),
-            case catch EpmdMod:address_please(Name, Host, inet) of
+            try EpmdMod:address_please(Name, Host, inet) of
                 {ok, _Addr} ->
                     true;
                 {ok, _Addr, _Port, _Version} ->
                     true;
                 _ ->
-                    %% Even if address lookup fails, allow local connections
-                    %% This is needed during initial node startup
+                    true
+            catch
+                %% Even if address lookup fails, allow local connections.
+                %% This is needed during initial node startup.
+                _:_ ->
                     true
             end;
         _ ->
@@ -297,15 +300,27 @@ setup(Node, Type, MyNode, LongOrShortNames, SetupTime) ->
 -spec close(Listen :: term()) -> ok.
 close(#quic_dist_listener{server_name = ServerName}) ->
     %% First try to stop via supervised server
-    catch quic:stop_server(ServerName),
+    try
+        quic:stop_server(ServerName)
+    catch
+        _:_ -> ok
+    end,
     %% Also check for early boot standalone listener
     Key = {quic_dist_early_listener, ServerName},
     case persistent_term:get(Key, undefined) of
         undefined ->
             ok;
         #{pid := Pid} ->
-            catch quic_listener:stop(Pid),
-            catch persistent_term:erase(Key),
+            try
+                quic_listener:stop(Pid)
+            catch
+                _:_ -> ok
+            end,
+            try
+                persistent_term:erase(Key)
+            catch
+                _:_ -> ok
+            end,
             ok
     end;
 close(_) ->
@@ -875,7 +890,7 @@ gatekeeper(Conn, Callback, Timeout) ->
                 {ok, _} ->
                     finalize_server_handoff(Conn);
                 {error, Reason} ->
-                    catch quic:close(Conn, normal),
+                    quic:safe_close(Conn, normal),
                     exit({auth_failed, Reason})
             end;
         {quic, Conn, {closed, Reason}} ->
@@ -883,7 +898,7 @@ gatekeeper(Conn, Callback, Timeout) ->
         {quic, Conn, {transport_error, Code, Reason}} ->
             exit({transport_error, Code, Reason})
     after Timeout ->
-        catch quic:close(Conn, normal),
+        quic:safe_close(Conn, normal),
         exit({auth_failed, handshake_timeout})
     end.
 
@@ -898,7 +913,7 @@ finalize_server_handoff(Conn) ->
             drain_quic_events(Conn, ControllerPid),
             notify_acceptor(ControllerPid);
         {error, Reason} ->
-            catch quic:close(Conn, normal),
+            quic:safe_close(Conn, normal),
             exit({controller_failed, Reason})
     end.
 
@@ -1238,7 +1253,7 @@ wait_for_connection(Kernel, Node, Conn, MyNode, Type, Timer, Config) ->
                 ok ->
                     start_client_controller(Kernel, Node, Conn, MyNode, Type, Timer);
                 {error, AuthReason} ->
-                    catch quic:close(Conn, normal),
+                    quic:safe_close(Conn, normal),
                     ?shutdown2(Node, {auth_failed, AuthReason})
             end;
         {quic, Conn, {closed, Reason}} ->
@@ -1271,7 +1286,7 @@ start_client_controller(Kernel, Node, Conn, MyNode, Type, Timer) ->
             HSData = create_hs_data_setup(Kernel, DistCtrl, Node, MyNode, Type, Timer),
             dist_util:handshake_we_started(HSData);
         {error, Reason} ->
-            quic:close(Conn, normal),
+            quic:safe_close(Conn, normal),
             ?shutdown2(Node, {controller_failed, Reason})
     end.
 

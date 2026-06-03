@@ -58,7 +58,11 @@ start(Extra) when is_map(Extra) ->
 %% @doc Stop the echo server.
 -spec stop(handle()) -> ok.
 stop(#{name := Name}) ->
-    catch quic:stop_server(Name),
+    try
+        quic:stop_server(Name)
+    catch
+        _:_ -> ok
+    end,
     ok.
 
 %% @doc Recommended client connect options for talking to the echo

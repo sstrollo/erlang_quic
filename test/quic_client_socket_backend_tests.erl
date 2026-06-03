@@ -44,7 +44,7 @@ client_socket_backend_roundtrip() ->
             Received = collect_echo(Conn, StreamId, <<>>, 10000),
             ?assertEqual(Payload, Received)
         after
-            catch quic:close(Conn)
+            quic:safe_close(Conn)
         end
     after
         quic_test_echo_server:stop(Srv)
@@ -83,7 +83,7 @@ client_socket_backend_migrate() ->
             Received = collect_echo(Conn, StreamId, <<>>, 10000),
             ?assertEqual(Payload, Received)
         after
-            catch quic:close(Conn)
+            quic:safe_close(Conn)
         end
     after
         quic_test_echo_server:stop(Srv)
@@ -110,7 +110,11 @@ client_pre_opened_socket_rejects_socket_backend() ->
             Result = quic:connect("127.0.0.1", Port, Opts, self()),
             ?assertMatch({error, {incompatible_options, _}}, Result)
         after
-            catch gen_udp:close(UdpSocket)
+            try
+                gen_udp:close(UdpSocket)
+            catch
+                _:_ -> ok
+            end
         end
     after
         quic_test_echo_server:stop(Srv)
@@ -149,7 +153,7 @@ client_receiver_crash_closes_connection() ->
                 error(no_close_event)
             end
         after
-            catch quic:close(Conn)
+            quic:safe_close(Conn)
         end
     after
         quic_test_echo_server:stop(Srv)

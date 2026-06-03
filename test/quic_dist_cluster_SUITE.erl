@@ -357,7 +357,11 @@ start_cluster(N, _CertDir) ->
 stop_cluster(Nodes) ->
     lists:foreach(
         fun(Node) ->
-            catch rpc:call(Node, erlang, halt, [0])
+            try
+                rpc:call(Node, erlang, halt, [0])
+            catch
+                _:_ -> ok
+            end
         end,
         Nodes
     ).

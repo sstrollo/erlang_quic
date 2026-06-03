@@ -13,7 +13,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, ubuntu-24.04]
         include:
           - os: ubuntu-22.04
             otp: '26'
@@ -26,6 +25,9 @@ jobs:
             rebar3: '3.24.0'
           - os: ubuntu-24.04
             otp: '28'
+            rebar3: 'nightly'
+          - os: ubuntu-24.04
+            otp: '29'
             rebar3: 'nightly'
 
     steps:

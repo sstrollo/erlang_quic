@@ -85,7 +85,11 @@ transient_caller_with_datagram_flag(Config) ->
     try
         {200, <<"hello">>} = do_get(Port)
     after
-        catch quic_h3:stop_server(Name)
+        try
+            quic_h3:stop_server(Name)
+        catch
+            _:_ -> ok
+        end
     end,
     ok.
 
@@ -134,7 +138,11 @@ custom_owner_receives_datagram(Config) ->
 
         quic_h3:close(Conn)
     after
-        catch quic_h3:stop_server(Name)
+        try
+            quic_h3:stop_server(Name)
+        catch
+            _:_ -> ok
+        end
     end,
     ok.
 

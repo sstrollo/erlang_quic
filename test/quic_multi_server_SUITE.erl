@@ -80,7 +80,12 @@ init_per_testcase(_TestCase, Config) ->
     lists:foreach(
         fun(Name) ->
             _ = quic:stop_server(Name),
-            _ = (catch quic_server_registry:unregister(Name))
+            _ =
+                (try
+                    quic_server_registry:unregister(Name)
+                catch
+                    _:_ -> ok
+                end)
         end,
         quic:which_servers()
     ),
@@ -154,7 +159,12 @@ server_restart_recovery(_Config) ->
 
     %% Stop server
     ok = quic:stop_server(recovery_server),
-    _ = (catch quic_server_registry:unregister(recovery_server)),
+    _ =
+        (try
+            quic_server_registry:unregister(recovery_server)
+        catch
+            _:_ -> ok
+        end),
     timer:sleep(100),
 
     %% Verify it's gone
@@ -237,7 +247,12 @@ server_port_reuse_after_stop(_Config) ->
 
     %% Stop the server
     ok = quic:stop_server(port_test_server),
-    _ = (catch quic_server_registry:unregister(port_test_server)),
+    _ =
+        (try
+            quic_server_registry:unregister(port_test_server)
+        catch
+            _:_ -> ok
+        end),
     %% Give OS time to release the port
     timer:sleep(200),
 
