@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.6.4] - 2026-06-05
+
+### Changed
+- HTTP/3 no longer accumulates received DATA payloads in the stream record. Data still reaches owners and handlers through the existing delivery path, while Content-Length and unbounded-body limits are enforced from a byte counter. The `#h3_stream.body` field is retained for compatibility but is no longer populated.
+
 ## [1.6.3] - 2026-06-03
 
 ### Added
