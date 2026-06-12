@@ -4,8 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.6.5] - 2026-06-12
+
 ### Added
 - `quic_h3:respond/5` sends an HTTP/3 response status, headers and full body with end-stream in a single connection call, coalescing what previously took `send_response/4` plus `send_data/4`. HEAD, 204 and 304 responses send no body.
+- `quic:start_server/3` accepts a `sni_callback` that selects the server certificate and key per connection from the ClientHello SNI (RFC 6066 §3), so an HTTP/3 listener can present different certificates per hostname. The callback is invoked with the parsed `server_name` and returns `{ok, #{cert => Cert, key => Key, cert_chain => Chain}}` or `{error, _}`; an error, malformed result or raised exception fails the handshake with a `handshake_failure` alert. The static `cert`/`key` remain the default when no callback is set.
 
 ## [1.6.4] - 2026-06-05
 
