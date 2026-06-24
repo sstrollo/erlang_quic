@@ -3541,13 +3541,19 @@ send_app_packet_internal(Payload, Frames, State) ->
                     undefined -> State#state.socket_state;
                     _ -> NewSocketState
                 end,
+            %% Note: `last_activity' is deliberately NOT updated here. It tracks
+            %% activity *received from the peer* and drives the idle timer
+            %% (RFC 9000 §10.1) and keep-alive. Bumping it on every send meant a
+            %% peer that kept sending keep-alive PINGs / PTO retransmits into a
+            %% black hole reset its own idle timer forever and never timed out a
+            %% dead path. On a healthy path the peer's ACK is a received packet
+            %% that restarts the timer, so genuine activity is still covered.
             maybe_force_key_update(State#state{
                 pn_app = NewPNSpace,
                 cc_state = NewCCState,
                 loss_state = NewLossState,
                 packets_sent = State#state.packets_sent + 1,
                 socket_state = EffectiveSocketState,
-                last_activity = Now,
                 pto_dirty = true
             });
         {error, Reason, ClearedSocketState} ->
