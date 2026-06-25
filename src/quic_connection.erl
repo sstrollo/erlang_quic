@@ -5681,29 +5681,28 @@ process_tls_message(
     Transcript = <<(State#state.tls_transcript)/binary, OriginalMsg/binary>>,
     case quic_tls:parse_certificate(Body) of
         {ok, #{certificates := [First | Rest]}} ->
-            %% Client sent certificate - expect CertificateVerify next
-            State#state{
-                tls_state = ?TLS_AWAITING_CLIENT_CERT_VERIFY,
-                tls_transcript = Transcript,
-                peer_cert = First,
-                peer_cert_chain = Rest
-            };
+            %% RFC 8446 §4.4.2.4: validate the client's certificate chain against
+            %% our trust anchors before accepting it. Possession of the leaf's
+            %% private key is checked next, on CertificateVerify; the signature
+            %% check alone does not establish that the certificate is trusted.
+            case quic_cert:validate_client(First, Rest, State#state.cacerts) of
+                ok ->
+                    State#state{
+                        tls_state = ?TLS_AWAITING_CLIENT_CERT_VERIFY,
+                        tls_transcript = Transcript,
+                        peer_cert = First,
+                        peer_cert_chain = Rest
+                    };
+                {error, Reason} ->
+                    reject_client_cert(Reason, State)
+            end;
         {ok, #{certificates := []}} ->
-            %% Empty certificate - no CertificateVerify, wait for Finished
-            State#state{
-                tls_state = ?TLS_AWAITING_CLIENT_FINISHED,
-                tls_transcript = Transcript,
-                peer_cert = undefined,
-                peer_cert_chain = []
-            };
+            %% We reach this state only with verify=true, i.e. after sending a
+            %% CertificateRequest, so an empty client Certificate is a failure
+            %% (RFC 8446 §4.4.2.4: certificate_required).
+            reject_client_cert(no_certificate, State);
         {error, _} ->
-            %% Parse error - treat as empty
-            State#state{
-                tls_state = ?TLS_AWAITING_CLIENT_FINISHED,
-                tls_transcript = Transcript,
-                peer_cert = undefined,
-                peer_cert_chain = []
-            }
+            reject_client_cert({bad_cert, malformed}, State)
     end;
 %% Server receives client CertificateVerify (when verify=true and client sent cert)
 process_tls_message(
@@ -9096,6 +9095,15 @@ verify_server_authentication(Body, TranscriptHash, Advance, State) ->
             notify_owner({closed, {certificate_invalid, bad_signature}}, State),
             send_tls_alert(?TLS_ALERT_DECRYPT_ERROR, State)
     end.
+
+%% Reject a client certificate (mutual TLS) the way verify_server_authentication
+%% rejects a server one: tell the owner synchronously so a caller waiting on
+%% `{closed, _}' fails fast, then send the matching TLS alert.
+reject_client_cert(Reason, State) ->
+    ?LOG_ERROR(#{what => client_cert_invalid, reason => Reason}, ?QUIC_LOG_META),
+    notify_owner({error, {certificate_invalid, Reason}}, State),
+    notify_owner({closed, {certificate_invalid, Reason}}, State),
+    send_tls_alert(cert_alert_code(Reason), State).
 
 cert_alert_code(unknown_ca) -> ?TLS_ALERT_UNKNOWN_CA;
 cert_alert_code(no_trust_anchors) -> ?TLS_ALERT_UNKNOWN_CA;
