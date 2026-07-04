@@ -157,6 +157,8 @@
     short_header_first_byte/3,
     test_spin_state/1,
     test_spin_state_for/2,
+    %% Connection-level receive-window auto-tuning (RFC 9000 §4.1)
+    next_conn_max_data/5,
     %% Stateless reset token derivation (RFC 9000 §10.3.2)
     generate_stateless_reset_token/2,
     test_state_with_secret/1,
@@ -456,6 +458,10 @@
     %% Timers
     idle_timeout :: non_neg_integer(),
     last_activity :: non_neg_integer(),
+    %% RFC 9000 §10.1: true once an ack-eliciting packet has been sent since the
+    %% last received packet. Gates the send-side idle-timer restart so it fires
+    %% at most once per received packet (a black-holed sender still times out).
+    ack_eliciting_since_recv = false :: boolean(),
     timer_ref :: reference() | undefined,
 
     %% Congestion control and loss detection
@@ -2433,8 +2439,9 @@ handle_common_event(
             %% no PING needed.
             {keep_state, set_keep_alive_timer(State#state{keep_alive_timer = undefined})};
         false ->
-            %% Idle for a full interval: send a PING (which refreshes
-            %% last_activity via the send path) and re-arm a full interval.
+            %% Idle for a full interval: send a PING. Being ack-eliciting, it
+            %% refreshes last_activity if it is the first such packet since our
+            %% last receive (RFC 9000 §10.1); re-arm a full interval.
             State1 = send_keep_alive_ping(State#state{keep_alive_timer = undefined}),
             State2 = flush_dirty_timers(flush_socket_batch(State1)),
             {keep_state, set_keep_alive_timer(State2)}
@@ -3560,13 +3567,28 @@ send_app_packet_internal(Payload, Frames, State) ->
                     undefined -> State#state.socket_state;
                     _ -> NewSocketState
                 end,
+            %% RFC 9000 §10.1: restart the idle timer (by bumping last_activity)
+            %% only on the first ack-eliciting packet sent since we last received
+            %% one. Restarting on every send let a peer sending keep-alive PINGs /
+            %% PTO retransmits into a black hole hold its own idle timer open
+            %% forever; never restarting would spuriously close a reactivated idle
+            %% connection before its first ack returns. The flag is cleared on
+            %% every receive (update_last_activity/2).
+            RestartIdle = AckEliciting andalso (not State#state.ack_eliciting_since_recv),
+            NewLastActivity =
+                case RestartIdle of
+                    true -> Now;
+                    false -> State#state.last_activity
+                end,
             maybe_force_key_update(State#state{
                 pn_app = NewPNSpace,
                 cc_state = NewCCState,
                 loss_state = NewLossState,
                 packets_sent = State#state.packets_sent + 1,
                 socket_state = EffectiveSocketState,
-                last_activity = Now,
+                last_activity = NewLastActivity,
+                ack_eliciting_since_recv =
+                    AckEliciting orelse State#state.ack_eliciting_since_recv,
                 pto_dirty = true
             });
         {error, Reason, ClearedSocketState} ->
@@ -6543,23 +6565,14 @@ do_process_stream_data_buffered(StreamId, Offset, Data, Fin, State) ->
                                             (Now2 - LastConnUpdate) <
                                                 (SmoothedRTT2 * ?AUTO_TUNE_RTT_FACTOR)
                                     end,
-                                %% Calculate new window based on RTT-aware growth
-                                BaseNewMaxData =
-                                    case FastConsumption2 of
-                                        true ->
-                                            %% Double (aggressive growth)
-                                            min(
-                                                (NewDataReceivedVal + MaxDataLocalVal) * 2,
-                                                MaxWindow2
-                                            );
-                                        false ->
-                                            %% Linear (conservative growth)
-                                            min(
-                                                NewDataReceivedVal + MaxDataLocalVal +
-                                                    InitialConnWindow,
-                                                MaxWindow2
-                                            )
-                                    end,
+                                %% Calculate new window based on RTT-aware growth.
+                                BaseNewMaxData = next_conn_max_data(
+                                    NewDataReceivedVal,
+                                    MaxDataLocalVal,
+                                    MaxWindow2,
+                                    InitialConnWindow,
+                                    FastConsumption2
+                                ),
                                 %% Ensure connection window >= 1.5x largest stream window
                                 MaxStreamWindow = get_max_stream_recv_window(State2),
                                 MinConnWindow = trunc(
@@ -7192,9 +7205,11 @@ merge_ack_ranges(Ranges) ->
 update_last_activity(State) ->
     update_last_activity(State, erlang:monotonic_time(millisecond)).
 
-%% Now-accepting variant used by the receive hot path.
+%% Now-accepting variant used by the receive hot path. Clears
+%% ack_eliciting_since_recv so the next ack-eliciting send restarts the idle
+%% timer (RFC 9000 §10.1).
 update_last_activity(State, Now) ->
-    State#state{last_activity = Now}.
+    State#state{last_activity = Now, ack_eliciting_since_recv = false}.
 
 %% Flush the deferred PTO timer reset at batch boundaries. The idle and
 %% keep-alive timers are lazy (armed once, re-armed only on fire), so the
@@ -10735,6 +10750,29 @@ maybe_retire_cid(CID, #state{role = server, listener = Listener}) when is_pid(Li
     quic_listener:retire_cid(Listener, CID);
 maybe_retire_cid(_CID, _State) ->
     ok.
+
+%% @doc Compute the next connection-level MAX_DATA limit during receive-window
+%% auto-tuning. The limit is anchored at the bytes already received and a window
+%% is added on top, with only the *window size* capped at MaxWindow (the largest
+%% buffer we are willing to hold). This makes MAX_DATA slide forward as data is
+%% consumed — exactly as the per-stream MAX_STREAM_DATA update does.
+%%
+%% Capping the *absolute* limit at MaxWindow instead (the previous behaviour)
+%% froze MAX_DATA once the connection had received MaxWindow bytes in total: the
+%% sender then exhausted the connection window and stalled permanently on any
+%% transfer larger than MaxWindow, regardless of how fast the receiver consumed.
+%% Fast consumption doubles the window; otherwise it grows by one initial window.
+-spec next_conn_max_data(
+    non_neg_integer(),
+    non_neg_integer(),
+    non_neg_integer(),
+    non_neg_integer(),
+    boolean()
+) -> non_neg_integer().
+next_conn_max_data(DataReceived, MaxDataLocal, MaxWindow, _InitialWindow, true) ->
+    DataReceived + min(MaxDataLocal * 2, MaxWindow);
+next_conn_max_data(DataReceived, MaxDataLocal, MaxWindow, InitialWindow, false) ->
+    DataReceived + min(MaxDataLocal + InitialWindow, MaxWindow).
 
 %% @doc Generate a stateless reset token for a connection ID.
 %% RFC 9000 §10.3.2 requires the token to be hard for an external
