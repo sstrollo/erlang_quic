@@ -315,8 +315,12 @@
     %% Options
     server_name :: binary() | undefined,
     verify :: boolean(),
-    %% Trust anchors (DER) for server cert validation; undefined = OS store
+    %% Trust anchors (DER): a client validates the server cert against these, a
+    %% server validates a presented client cert; undefined = OS store
     cacerts :: [binary()] | undefined,
+    %% Server-side mutual TLS: require a valid client certificate. When false, an
+    %% empty client Certificate is accepted (optional mTLS, RFC 8446 §4.4.2.4).
+    require_client_cert = false :: boolean(),
 
     %% Encryption keys per level
     initial_keys :: {#crypto_keys{}, #crypto_keys{}} | undefined,
@@ -1113,6 +1117,8 @@ init({server, Opts}) ->
         owner = Listener,
         conn_ref = ConnRef,
         verify = maps:get(verify, Opts, false),
+        cacerts = maps:get(cacerts, Opts, undefined),
+        require_client_cert = maps:get(require_client_cert, Opts, false),
         initial_keys = InitialKeys,
         tls_state = ?TLS_AWAITING_CLIENT_HELLO,
         %% TLS 1.3 external PSK config (RFC 8446 §4.2.11). Either or
@@ -5738,10 +5744,21 @@ process_tls_message(
                     reject_client_cert(Reason, State)
             end;
         {ok, #{certificates := []}} ->
-            %% We reach this state only with verify=true, i.e. after sending a
-            %% CertificateRequest, so an empty client Certificate is a failure
-            %% (RFC 8446 §4.4.2.4: certificate_required).
-            reject_client_cert(no_certificate, State);
+            %% RFC 8446 §4.4.2.4: an empty client Certificate means the client has
+            %% none. The server MAY continue without client auth or abort with
+            %% certificate_required. Default to optional mTLS; only
+            %% require_client_cert makes a client certificate mandatory.
+            case State#state.require_client_cert of
+                true ->
+                    reject_client_cert(no_certificate, State);
+                false ->
+                    State#state{
+                        tls_state = ?TLS_AWAITING_CLIENT_FINISHED,
+                        tls_transcript = Transcript,
+                        peer_cert = undefined,
+                        peer_cert_chain = []
+                    }
+            end;
         {error, _} ->
             reject_client_cert({bad_cert, malformed}, State)
     end;

@@ -231,14 +231,9 @@ verify_certificate_verify_wrong_role_test() ->
 %% Integration Tests - Mutual TLS Handshake
 %%====================================================================
 
-%% Test server with verify=true, client without cert (empty Certificate).
-%% RFC 8446 4.4.2.4: once the server has sent a CertificateRequest, an empty
-%% client Certificate is a failure (certificate_required) rather than an
-%% anonymous-but-accepted handshake, so the server must reject the connection
-%% instead of completing it. The client may reach `connected' locally (it
-%% has already sent its own Finished) before the server's rejection arrives,
-%% so wait_for_rejection/1 tolerates an interleaved `connected' event instead
-%% of treating it as the final outcome.
+%% verify=true requests a client certificate but is optional mTLS by default:
+%% RFC 8446 §4.4.2.4 lets the server continue without client auth, so a client
+%% with no certificate still connects.
 server_verify_client_no_cert_test() ->
     ensure_started(),
     case generate_certs() of
@@ -247,7 +242,6 @@ server_verify_client_no_cert_test() ->
                 "verify_nocert_" ++ integer_to_list(erlang:unique_integer([positive]))
             ),
             try
-                %% Start server with verify=true
                 {ok, _} = quic:start_server(ServerName, 0, #{
                     cert => ServerCert,
                     key => ServerKey,
@@ -255,19 +249,45 @@ server_verify_client_no_cert_test() ->
                     verify => true
                 }),
                 {ok, Port} = quic:get_server_port(ServerName),
-
-                %% Connect without client cert
                 {ok, Conn} = quic:connect(
                     "127.0.0.1",
                     Port,
-                    #{
-                        alpn => [<<"h3">>],
-                        verify => false,
-                        server_name => <<"server">>
-                    },
+                    #{alpn => [<<"h3">>], verify => false, server_name => <<"server">>},
                     self()
                 ),
+                expect_connected_and_stable(Conn),
+                quic:close(Conn, normal)
+            after
+                cleanup_server_only(TmpDir, ServerName)
+            end;
+        {error, cert_generation_failed} ->
+            {skip, "OpenSSL not available"}
+    end.
 
+%% require_client_cert=true makes mTLS mandatory: a client with no certificate
+%% is rejected with certificate_required (RFC 8446 §4.4.2.4).
+server_require_client_cert_no_cert_test() ->
+    ensure_started(),
+    case generate_certs() of
+        {ok, TmpDir, ServerCert, ServerKey, _ClientCert, _ClientKey} ->
+            ServerName = list_to_atom(
+                "require_nocert_" ++ integer_to_list(erlang:unique_integer([positive]))
+            ),
+            try
+                {ok, _} = quic:start_server(ServerName, 0, #{
+                    cert => ServerCert,
+                    key => ServerKey,
+                    alpn => [<<"h3">>],
+                    verify => true,
+                    require_client_cert => true
+                }),
+                {ok, Port} = quic:get_server_port(ServerName),
+                {ok, Conn} = quic:connect(
+                    "127.0.0.1",
+                    Port,
+                    #{alpn => [<<"h3">>], verify => false, server_name => <<"server">>},
+                    self()
+                ),
                 ?assertMatch(
                     {peer_closed, transport, _Code, _FrameType, _Phrase},
                     wait_for_rejection(Conn)
@@ -279,37 +299,26 @@ server_verify_client_no_cert_test() ->
             {skip, "OpenSSL not available"}
     end.
 
-%% Read events off a connection until it closes, ignoring a `connected'
-%% event that may arrive first (see server_verify_client_no_cert_test/0).
-wait_for_rejection(Conn) ->
-    receive
-        {quic, Conn, {connected, _Info}} ->
-            wait_for_rejection(Conn);
-        {quic, Conn, {closed, Reason}} ->
-            Reason
-    after 10000 ->
-        ct:fail("expected connection to be rejected for missing client certificate")
-    end.
-
-%% Test server with verify=true, client with cert
-server_verify_client_with_cert_test() ->
+%% A presented client certificate that chains to a configured trust anchor is
+%% accepted and the connection stays up.
+server_verify_client_trusted_cert_test() ->
     ensure_started(),
     case generate_certs() of
         {ok, TmpDir, ServerCert, ServerKey, ClientCert, ClientKey} ->
             ServerName = list_to_atom(
-                "verify_cert_" ++ integer_to_list(erlang:unique_integer([positive]))
+                "verify_trusted_" ++ integer_to_list(erlang:unique_integer([positive]))
             ),
             try
-                %% Start server with verify=true
+                %% Trust the (self-signed) client cert as its own anchor.
                 {ok, _} = quic:start_server(ServerName, 0, #{
                     cert => ServerCert,
                     key => ServerKey,
                     alpn => [<<"h3">>],
-                    verify => true
+                    verify => true,
+                    require_client_cert => true,
+                    cacerts => [ClientCert]
                 }),
                 {ok, Port} = quic:get_server_port(ServerName),
-
-                %% Connect with client cert
                 {ok, Conn} = quic:connect(
                     "127.0.0.1",
                     Port,
@@ -322,21 +331,84 @@ server_verify_client_with_cert_test() ->
                     },
                     self()
                 ),
-
-                %% Wait for connection
-                receive
-                    {quic, Conn, {connected, _Info}} ->
-                        %% Handshake should complete successfully
-                        %% Server side would have the client cert
-                        quic:close(Conn, normal)
-                after 5000 ->
-                    ct:fail("Connection timeout")
-                end
+                expect_connected_and_stable(Conn),
+                quic:close(Conn, normal)
             after
                 cleanup_server_only(TmpDir, ServerName)
             end;
         {error, cert_generation_failed} ->
             {skip, "OpenSSL not available"}
+    end.
+
+%% A presented client certificate that does not chain to any configured trust
+%% anchor is rejected with unknown_ca, even though the client proves possession
+%% of the leaf's private key on CertificateVerify.
+server_verify_client_untrusted_cert_test() ->
+    ensure_started(),
+    case generate_certs() of
+        {ok, TmpDir, ServerCert, ServerKey, ClientCert, ClientKey} ->
+            ServerName = list_to_atom(
+                "verify_untrusted_" ++ integer_to_list(erlang:unique_integer([positive]))
+            ),
+            try
+                %% Trust only the server cert, not the client's self-signed one.
+                {ok, _} = quic:start_server(ServerName, 0, #{
+                    cert => ServerCert,
+                    key => ServerKey,
+                    alpn => [<<"h3">>],
+                    verify => true,
+                    cacerts => [ServerCert]
+                }),
+                {ok, Port} = quic:get_server_port(ServerName),
+                {ok, Conn} = quic:connect(
+                    "127.0.0.1",
+                    Port,
+                    #{
+                        alpn => [<<"h3">>],
+                        verify => false,
+                        server_name => <<"server">>,
+                        cert => ClientCert,
+                        key => ClientKey
+                    },
+                    self()
+                ),
+                ?assertMatch(
+                    {peer_closed, transport, _Code, _FrameType, _Phrase},
+                    wait_for_rejection(Conn)
+                )
+            after
+                cleanup_server_only(TmpDir, ServerName)
+            end;
+        {error, cert_generation_failed} ->
+            {skip, "OpenSSL not available"}
+    end.
+
+%% Read events off a connection until it closes, ignoring a `connected' event
+%% that may arrive first: the client completes its own side of the handshake
+%% (sends Finished) before the server's rejection arrives.
+wait_for_rejection(Conn) ->
+    receive
+        {quic, Conn, {connected, _Info}} ->
+            wait_for_rejection(Conn);
+        {quic, Conn, {closed, Reason}} ->
+            Reason
+    after 10000 ->
+        ct:fail("expected connection to be rejected for client certificate")
+    end.
+
+%% Assert the handshake completes and the server does not then reject it: wait
+%% for `connected' and confirm no close event follows within a short window.
+expect_connected_and_stable(Conn) ->
+    receive
+        {quic, Conn, {connected, _Info}} ->
+            receive
+                {quic, Conn, {closed, Reason}} ->
+                    ct:fail({unexpected_close, Reason})
+            after 500 ->
+                ok
+            end
+    after 5000 ->
+        ct:fail("connection timeout")
     end.
 
 %% Test server with verify=false (default), no CertificateRequest sent
